@@ -38,6 +38,7 @@
     "url": "https://github.com/gregflint/provision-wasp-saas/issues"
   },
   "dependencies": {
+    "@inquirer/prompts": "^7.0.0",
     "@neondatabase/api-client": "^2.2.0",
     "pg": "^8.11.5"
   },

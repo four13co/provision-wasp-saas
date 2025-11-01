@@ -4,7 +4,13 @@ dist
 build
 .turbo
 .next
-.env*
+
+# Environment files (contain secrets)
+.env
+.env.local
+# But keep the example file
+!.env.example
+
 coverage
 pnpm-lock.yaml
 

@@ -1,122 +1,264 @@
 /**
  * Main provisioning orchestrator for Wasp/OpenSaaS projects
+ * Coordinates all infrastructure providers with dependency management
  */
 
 import path from 'node:path';
 import { parseWaspEnv } from './wasp-parser.js';
 import { ensureOpAuth, opEnsureVault } from './op-util.js';
 import { createGitHubRepo, setupGitHubSecrets } from './github-provision.js';
-// TODO: These functions need to be created or exported from existing files
-// import { provisionNeon } from './neon-provision.js';
-// import { provisionCapRover } from './caprover-provision.js';
-// import { provisionVercel } from './vercel-provision.js';
+import { emitEnvFiles } from './env-emit.js';
+import { provisionOnePassword } from './onepassword-provision.js';
+import { providers, resolveDependencies, getExecutionOrder, ProviderName, InfraProviderName } from './providers.js';
+import { rollback, collectRollbackActions, RollbackAction } from './rollback.js';
+import { ProvisioningError } from './rollback.js';
 
 export interface ProvisionOptions {
-  verbose: boolean;
-  dryRun: boolean;
+  // Component selection (undefined = all providers)
+  components?: ProviderName[];
+
+  // Also include github and env
+  includeGitHub?: boolean;
+  includeEnv?: boolean;
+
+  // Environment selection
+  environments?: Array<'dev' | 'prod'>;
+
+  // Flags
+  verbose?: boolean;
+  dryRun?: boolean;
+
+  // Auto-detected
+  projectName?: string;
+  projectDir?: string;
 }
 
-export async function provision(options: ProvisionOptions): Promise<void> {
-  const { verbose, dryRun } = options;
+/**
+ * Main provisioning function
+ * Orchestrates all infrastructure provisioning with dependency resolution
+ */
+export async function provision(options: ProvisionOptions = {}): Promise<void> {
+  const {
+    components,
+    includeGitHub = false,
+    includeEnv = false,
+    environments = ['dev', 'prod'],
+    verbose = false,
+    dryRun = false,
+    projectName: customProjectName,
+    projectDir = process.cwd()
+  } = options;
 
-  const cwd = process.cwd();
-  const projectName = path.basename(cwd);
+  const projectName = customProjectName || path.basename(projectDir);
+  const rollbackActions: RollbackAction[] = [];
 
   if (verbose) {
-    console.log(`Project directory: ${cwd}`);
-    console.log(`Project name: ${projectName}`);
+    console.log('');
+    console.log(`Project: ${projectName}`);
+    console.log(`Directory: ${projectDir}`);
+    console.log(`Environments: ${environments.join(', ')}`);
+    console.log('');
   }
 
-  // Step 1: Parse Wasp environment requirements
-  console.log('📋 Parsing environment configuration...');
-  const envConfig = parseWaspEnv(cwd);
+  // Determine which components to provision
+  const requestedComponents = components || (['onepassword', 'neon', 'caprover', 'vercel', 'resend'] as ProviderName[]);
+  const componentsToProvision = resolveDependencies(requestedComponents);
+
   if (verbose) {
-    console.log(`  Found ${envConfig.serverVars.length} server variables`);
-    console.log(`  Found ${envConfig.clientVars.length} client variables`);
+    console.log(`Components to provision: ${componentsToProvision.join(', ')}`);
+    if (includeGitHub) console.log('Will setup GitHub repository');
+    if (includeEnv) console.log('Will emit environment files');
+    console.log('');
   }
 
-  // Step 2: Ensure 1Password authentication
-  console.log('🔐 Checking 1Password authentication...');
-  if (!dryRun) {
-    ensureOpAuth();
+  try {
+    // Parse Wasp environment requirements (for reference)
+    if (verbose) {
+      console.log('📋 Parsing Wasp environment configuration...');
+      try {
+        const envConfig = parseWaspEnv(projectDir);
+        console.log(`  Found ${envConfig.serverVars.length} server variables`);
+        console.log(`  Found ${envConfig.clientVars.length} client variables`);
+      } catch (e: any) {
+        console.warn(`  Warning: Could not parse Wasp env: ${e?.message || e}`);
+      }
+      console.log('');
+    }
+
+    // Phase 1: 1Password vaults (foundational)
+    if (componentsToProvision.includes('onepassword')) {
+      console.log('🔐 Setting up 1Password vaults...');
+
+      if (!dryRun) {
+        ensureOpAuth();
+      }
+
+      for (const env of environments) {
+        const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+        if (verbose) {
+          console.log(`  Environment: ${env}`);
+        }
+
+        const { result, rollbackActions: opRollback } = await provisionOnePassword({
+          vaultName,
+          projectName,
+          envSuffix: env,
+          verbose,
+          dryRun
+        });
+
+        rollbackActions.push(...opRollback);
+      }
+
+      console.log('');
+    }
+
+    // Phase 2: Infrastructure providers (can run in parallel per environment)
+    const infraProviders: InfraProviderName[] = ['neon', 'caprover', 'vercel', 'resend'];
+    const toProvision = infraProviders.filter(p => componentsToProvision.includes(p));
+
+    if (toProvision.length > 0) {
+      console.log('🚀 Provisioning infrastructure...');
+      console.log('');
+
+      for (const env of environments) {
+        if (verbose && environments.length > 1) {
+          console.log(`Environment: ${env}`);
+        }
+
+        // Run all providers for this environment in parallel
+        const tasks = toProvision.map(async (providerName) => {
+          try {
+            const { result, rollbackActions: providerRollback } = await providers[providerName]({
+              projectName,
+              envSuffix: env,
+              verbose,
+              dryRun
+            });
+
+            rollbackActions.push(...providerRollback);
+
+            return { providerName, success: true, result };
+          } catch (e: any) {
+            throw new ProvisioningError(
+              `${providerName} provisioning failed: ${e?.message || e}`,
+              providerName,
+              rollbackActions
+            );
+          }
+        });
+
+        await Promise.all(tasks);
+
+        if (verbose && environments.length > 1) {
+          console.log('');
+        }
+      }
+
+      if (!verbose || environments.length === 1) {
+        console.log('');
+      }
+    }
+
+    // Phase 3: GitHub (sequential, after infrastructure)
+    if (includeGitHub) {
+      console.log('📦 Setting up GitHub repository...');
+
+      if (!dryRun) {
+        const vaultDev = `${projectName}-dev`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+        const vaultProd = `${projectName}-prod`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+        try {
+          await createGitHubRepo({ projectName, verbose });
+          await setupGitHubSecrets({ projectName, vaultDev, vaultProd, verbose });
+
+          if (verbose) {
+            console.log(`  ✓ GitHub repository configured`);
+          } else {
+            console.log(`  ✓ GitHub: ${projectName}`);
+          }
+        } catch (e: any) {
+          throw new ProvisioningError(
+            `GitHub setup failed: ${e?.message || e}`,
+            'github',
+            rollbackActions
+          );
+        }
+      } else {
+        console.log(`  [DRY RUN] Would setup GitHub repository`);
+      }
+
+      console.log('');
+    }
+
+    // Phase 4: Environment files (last, reads from vaults)
+    if (includeEnv) {
+      console.log('📝 Generating environment files...');
+
+      for (const env of environments) {
+        const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+        try {
+          await emitEnvFiles({
+            projectName,
+            envSuffix: env,
+            vaultName,
+            verbose,
+            dryRun
+          });
+        } catch (e: any) {
+          console.warn(`  Warning: Failed to emit env files for ${env}: ${e?.message || e}`);
+        }
+      }
+
+      console.log('');
+    }
+
+    // Success!
+    console.log('✅ Provisioning complete!');
+    console.log('');
+
+    if (!dryRun) {
+      console.log('Next steps:');
+      console.log('  1. Review generated secrets in 1Password vaults');
+      console.log('  2. Update any placeholder values as needed');
+
+      if (includeGitHub) {
+        console.log('  3. Push your code to trigger the first deployment:');
+        console.log(`     git remote add origin https://github.com/YOUR_USERNAME/${projectName}.git`);
+        console.log('     git push -u origin Development');
+      } else {
+        console.log('  3. Set up GitHub with: --provision-github');
+      }
+
+      console.log('');
+    }
+  } catch (error) {
+    // Handle provisioning errors with rollback
+    if (error instanceof ProvisioningError) {
+      console.error('');
+      console.error(`❌ ${error.component} provisioning failed:`);
+      console.error(`   ${error.message}`);
+      console.error('');
+
+      if (!dryRun && rollbackActions.length > 0) {
+        await rollback(rollbackActions, verbose);
+      }
+
+      throw error;
+    } else {
+      // Unexpected error
+      console.error('');
+      console.error('❌ Unexpected error during provisioning:');
+      console.error(error instanceof Error ? error.message : String(error));
+      console.error('');
+
+      if (!dryRun && rollbackActions.length > 0) {
+        await rollback(rollbackActions, verbose);
+      }
+
+      throw error;
+    }
   }
-
-  // Step 3: Create 1Password vaults
-  console.log('🗄️  Creating 1Password vaults...');
-  const vaultDev = `${projectName}-dev`;
-  const vaultProd = `${projectName}-prod`;
-
-  if (!dryRun) {
-    opEnsureVault(vaultDev);
-    opEnsureVault(vaultProd);
-  }
-  console.log(`  ✓ Created vaults: ${vaultDev}, ${vaultProd}`);
-
-  // Step 4: Bootstrap vaults with secrets
-  console.log('🔑 Generating and storing secrets...');
-  if (!dryRun) {
-    // TODO: Call op-bootstrap-project for each environment
-  }
-  console.log('  ✓ Secrets stored in 1Password');
-
-  // Step 5: Provision Neon database
-  console.log('🗄️  Provisioning Neon database...');
-  if (!dryRun) {
-    // TODO: Implement Neon provisioning
-    // await provisionNeon({ projectName, env: 'dev', verbose });
-    // await provisionNeon({ projectName, env: 'prod', verbose });
-  }
-  console.log('  ✓ Database provisioned');
-
-  // Step 6: Provision CapRover backend
-  console.log('🐳 Provisioning CapRover backend...');
-  if (!dryRun) {
-    // TODO: Implement CapRover provisioning
-    // await provisionCapRover({ projectName, env: 'dev', verbose });
-    // await provisionCapRover({ projectName, env: 'prod', verbose });
-  }
-  console.log('  ✓ CapRover backend ready');
-
-  // Step 7: Provision Vercel frontend
-  console.log('▲ Provisioning Vercel frontend...');
-  if (!dryRun) {
-    // TODO: Implement Vercel provisioning
-    // await provisionVercel({ projectName, env: 'dev', verbose });
-    // await provisionVercel({ projectName, env: 'prod', verbose });
-  }
-  console.log('  ✓ Vercel frontend ready');
-
-  // Step 8: Create GitHub repository
-  console.log('📦 Creating GitHub repository...');
-  if (!dryRun) {
-    // TODO: Implement GitHub repo creation
-    // await createGitHubRepo({ projectName, verbose });
-  }
-  console.log('  ✓ GitHub repository created');
-
-  // Step 9: Setup GitHub secrets
-  console.log('🔐 Configuring GitHub secrets...');
-  if (!dryRun) {
-    // TODO: Run op-service-account.sh
-    // await setupGitHubSecrets({ projectName, vaultDev, vaultProd, verbose });
-  }
-  console.log('  ✓ GitHub secrets configured');
-
-  // Step 10: Emit .env files
-  console.log('📝 Generating .env files...');
-  if (!dryRun) {
-    // TODO: Emit .env.server and .env.client from 1Password
-  }
-  console.log('  ✓ Environment files created');
-
-  console.log('');
-  console.log('🎉 All done! Your Wasp app infrastructure is ready.');
-  console.log('');
-  console.log('Next steps:');
-  console.log('  1. Review generated .env.server and .env.client files');
-  console.log('  2. Update any placeholder values in 1Password vaults');
-  console.log('  3. Push your code to trigger the first deployment:');
-  console.log(`     git remote add origin https://github.com/YOUR_USERNAME/${projectName}.git`);
-  console.log('     git push -u origin Development');
-  console.log('');
 }
