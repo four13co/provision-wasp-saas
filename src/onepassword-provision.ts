@@ -22,7 +22,7 @@ function setSecret(vaultName: string, title: string, value?: string, verbose?: b
     if (value) {
       const esc = value.replace(/'/g, "'\\''");
       sh(
-        `op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local --generate-password=false password='${esc}'`,
+        `op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local password='${esc}'`,
         verbose
       );
     } else {
@@ -192,8 +192,8 @@ export async function deleteOnePasswordInstance(
   try {
     ensureOpAuth();
 
-    // Delete vault
-    sh(`op vault delete "${instanceId}" --force`, verbose);
+    // Delete vault (op CLI automatically confirms in non-interactive mode)
+    sh(`op vault delete "${instanceId}"`, verbose);
 
     if (verbose) {
       console.log(`    Deleted 1Password vault ${instanceId}`);

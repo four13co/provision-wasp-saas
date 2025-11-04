@@ -115,3 +115,115 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
     if (verbose) console.log(`  Copied ${template}`);
   }
 }
+
+/**
+ * List all GitHub repositories for cleanup
+ */
+export async function listGitHubInstances(
+  options: { projectName?: string; envSuffix?: 'dev' | 'prod'; filterPattern?: string; verbose?: boolean }
+): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
+  const { projectName, filterPattern, verbose } = options;
+
+  try {
+    // Try to detect organization from current repo, otherwise use authenticated user
+    let owner: string;
+    try {
+      owner = execSync('gh repo view --json owner -q .owner.login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+    } catch {
+      // Fall back to authenticated user if not in a repo
+      owner = execSync('gh api user -q .login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+    }
+
+    // List repositories for the owner (org or user)
+    const output = execSync(`gh repo list "${owner}" --json name,createdAt,url,visibility --limit 1000`, {
+      stdio: 'pipe',
+      encoding: 'utf-8'
+    });
+    const repos = JSON.parse(output) as any[];
+
+    // Filter resources
+    let matches = repos;
+
+    if (filterPattern) {
+      // Use custom filter pattern
+      const pattern = filterPattern.toLowerCase();
+      matches = matches.filter((repo: any) => {
+        const name = (repo?.name || '').toLowerCase();
+        return name.includes(pattern);
+      });
+    } else if (projectName) {
+      // Filter by project name (GitHub repos don't have -dev/-prod suffix typically)
+      const pattern = projectName.toLowerCase();
+      matches = matches.filter((repo: any) => {
+        const name = (repo?.name || '').toLowerCase();
+        return name === pattern || name.startsWith(`${pattern}-`);
+      });
+    }
+    // If neither filterPattern nor projectName: return all resources
+
+    return matches.map((repo: any) => ({
+      id: `${owner}/${repo.name}`,
+      name: repo.name,
+      environment: 'unknown' as const,
+      metadata: {
+        url: repo.url,
+        visibility: repo.visibility
+      },
+      createdAt: repo.createdAt
+    }));
+  } catch (error: any) {
+    if (verbose) {
+      console.warn(`  Warning: Failed to list GitHub repositories: ${error?.message || error}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Delete a GitHub repository
+ */
+export async function deleteGitHubInstance(
+  instanceId: string,
+  options: { verbose?: boolean }
+): Promise<{ id: string; name: string; success: boolean; error?: string }> {
+  const { verbose } = options;
+
+  try {
+    // instanceId format: "username/repo-name"
+    const repoName = instanceId.split('/')[1] || instanceId;
+
+    // Delete repository with confirmation flag
+    execSync(`gh repo delete "${instanceId}" --yes`, {
+      stdio: verbose ? 'inherit' : 'pipe'
+    });
+
+    if (verbose) {
+      console.log(`    Deleted GitHub repository ${instanceId}`);
+    }
+
+    return {
+      id: instanceId,
+      name: repoName,
+      success: true
+    };
+  } catch (error: any) {
+    const errorMsg = error?.message || String(error);
+
+    // Check for missing delete_repo scope
+    if (errorMsg.includes('delete_repo')) {
+      return {
+        id: instanceId,
+        name: instanceId.split('/')[1] || instanceId,
+        success: false,
+        error: 'Missing delete_repo scope. Run: gh auth refresh -h github.com -s delete_repo'
+      };
+    }
+
+    return {
+      id: instanceId,
+      name: instanceId.split('/')[1] || instanceId,
+      success: false,
+      error: errorMsg
+    };
+  }
+}

@@ -6,20 +6,22 @@
 import { provisionNeon, listNeonInstances, deleteNeonInstance } from './neon-provision.js';
 import { provisionCapRover, listCapRoverInstances, deleteCapRoverInstance } from './caprover-provision.js';
 import { provisionVercel, listVercelInstances, deleteVercelInstance } from './vercel-provision.js';
+import { provisionNetlify, listNetlifyInstances, deleteNetlifyInstance } from './netlify-provision.js';
 import { provisionResend, listResendInstances, deleteResendInstance } from './resend-provision.js';
 import { listOnePasswordInstances, deleteOnePasswordInstance } from './onepassword-provision.js';
+import { listGitHubInstances, deleteGitHubInstance } from './github-provision.js';
 import { ProvisionOptions, CleanupOptions, ProviderInstance, DeleteInstanceResult } from './types.js';
 
 /**
  * Infrastructure provider names (excludes onepassword which has different signature)
  */
-export type InfraProviderName = 'neon' | 'caprover' | 'vercel' | 'resend';
+export type InfraProviderName = 'neon' | 'caprover' | 'vercel' | 'netlify' | 'resend';
 
 /**
- * All provider names including onepassword
- * Note: 'onepassword' has a different function signature and is called directly in provision.ts
+ * All provider names including onepassword and github
+ * Note: 'onepassword' and 'github' have different function signatures and are called directly in provision.ts
  */
-export type ProviderName = 'onepassword' | InfraProviderName;
+export type ProviderName = 'onepassword' | 'github' | InfraProviderName;
 
 /**
  * Infrastructure provider function signatures (excludes onepassword)
@@ -28,6 +30,7 @@ export interface ProviderRegistry {
   neon: typeof provisionNeon;
   caprover: typeof provisionCapRover;
   vercel: typeof provisionVercel;
+  netlify: typeof provisionNetlify;
   resend: typeof provisionResend;
 }
 
@@ -39,6 +42,7 @@ export const providers: ProviderRegistry = {
   neon: provisionNeon,
   caprover: provisionCapRover,
   vercel: provisionVercel,
+  netlify: provisionNetlify,
   resend: provisionResend
 };
 
@@ -51,12 +55,16 @@ export interface CleanupFunctions {
 }
 
 /**
- * Cleanup registry for all providers (including onepassword)
+ * Cleanup registry for all providers (including onepassword and github)
  */
 export const cleanupRegistry: Record<ProviderName, CleanupFunctions> = {
   onepassword: {
     listInstances: listOnePasswordInstances,
     deleteInstance: deleteOnePasswordInstance
+  },
+  github: {
+    listInstances: listGitHubInstances,
+    deleteInstance: deleteGitHubInstance
   },
   neon: {
     listInstances: listNeonInstances,
@@ -69,6 +77,10 @@ export const cleanupRegistry: Record<ProviderName, CleanupFunctions> = {
   vercel: {
     listInstances: listVercelInstances,
     deleteInstance: deleteVercelInstance
+  },
+  netlify: {
+    listInstances: listNetlifyInstances,
+    deleteInstance: deleteNetlifyInstance
   },
   resend: {
     listInstances: listResendInstances,
@@ -105,17 +117,21 @@ export const DEPENDENCIES: Record<string, ComponentDependencies> = {
     requires: ['onepassword'],
     optional: []
   },
+  'netlify': {
+    requires: ['onepassword'],
+    optional: []
+  },
   'resend': {
     requires: ['onepassword'],
     optional: []
   },
   'github': {
     requires: ['onepassword'],
-    optional: ['neon', 'caprover', 'vercel']
+    optional: ['neon', 'caprover', 'vercel', 'netlify']
   },
   'env': {
     requires: ['onepassword'],
-    optional: ['neon', 'caprover', 'vercel', 'resend']
+    optional: ['neon', 'caprover', 'vercel', 'netlify', 'resend']
   }
 };
 
@@ -143,7 +159,7 @@ export function resolveDependencies(requested: ProviderName[]): ProviderName[] {
   }
 
   // Return in dependency order (foundational components first)
-  const order: ProviderName[] = ['onepassword', 'neon', 'caprover', 'vercel', 'resend'];
+  const order: ProviderName[] = ['onepassword', 'neon', 'caprover', 'vercel', 'netlify', 'resend'];
   return order.filter(c => resolved.has(c));
 }
 

@@ -314,6 +314,11 @@ export async function listCapRoverInstances(
   const url = process.env.CAPROVER_URL;
   const password = process.env.CAPROVER_PASSWORD;
 
+  if (verbose) {
+    console.log(`  Debug: CAPROVER_URL is ${url ? 'set' : 'NOT SET'}`);
+    console.log(`  Debug: CAPROVER_PASSWORD is ${password ? 'set' : 'NOT SET'}`);
+  }
+
   if (!url) {
     throw new Error('CAPROVER_URL not set. Add to .env file');
   }
@@ -324,6 +329,10 @@ export async function listCapRoverInstances(
 
   const base = url.endsWith('/') ? url.slice(0, -1) : url;
 
+  if (verbose) {
+    console.log(`  Debug: Connecting to CapRover at ${base}`);
+  }
+
   try {
     // Login
     const loginResp = await fetch(`${base}/api/v2/login`, {
@@ -332,6 +341,10 @@ export async function listCapRoverInstances(
       body: JSON.stringify({ password })
     });
 
+    if (verbose) {
+      console.log(`  Debug: Login response status: ${loginResp.status}`);
+    }
+
     const loginData: any = loginResp.ok ? await loginResp.json() : null;
     const token = loginData?.data?.token;
 
@@ -339,13 +352,43 @@ export async function listCapRoverInstances(
       throw new Error('Failed to authenticate with CapRover');
     }
 
-    // List apps
-    const appsResp = await fetch(`${base}/user/apps/appDefinitions/`, {
+    if (verbose) {
+      console.log(`  Debug: Authentication successful`);
+    }
+
+    // List apps - try different API path variations
+    let appsResp: Response;
+    let appsData: any = null;
+
+    // Try v2 API first
+    appsResp = await fetch(`${base}/api/v2/user/apps/appDefinitions`, {
       headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
     });
 
-    const appsData: any = appsResp.ok ? await appsResp.json() : null;
+    if (verbose) {
+      console.log(`  Debug: Apps list response status (v2): ${appsResp.status}`);
+    }
+
+    if (!appsResp.ok) {
+      // Fall back to non-versioned API
+      appsResp = await fetch(`${base}/user/apps/appDefinitions`, {
+        headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+      });
+
+      if (verbose) {
+        console.log(`  Debug: Apps list response status (non-versioned): ${appsResp.status}`);
+      }
+    }
+
+    appsData = appsResp.ok ? await appsResp.json() : null;
     const apps = appsData?.data?.appDefinitions || [];
+
+    if (verbose) {
+      console.log(`  Debug: Found ${apps.length} total apps on CapRover`);
+      if (apps.length > 0) {
+        console.log(`  Debug: App names: ${apps.map((a: any) => a.appName).join(', ')}`);
+      }
+    }
 
     // Filter resources
     let matches = apps;

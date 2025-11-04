@@ -46,6 +46,22 @@ export interface VercelResult {
 }
 
 /**
+ * A single Netlify site (dev or prod)
+ */
+export interface NetlifySite {
+  id: string;
+  name: string;
+  url: string;
+}
+
+/**
+ * Result returned from Netlify frontend provisioning
+ */
+export interface NetlifyResult {
+  site: NetlifySite;
+}
+
+/**
  * A Resend API key (dev or prod)
  */
 export interface ResendKey {

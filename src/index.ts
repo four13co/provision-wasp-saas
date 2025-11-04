@@ -26,6 +26,7 @@ interface CliArgs {
   provisionNeon: boolean;
   provisionCapRover: boolean;
   provisionVercel: boolean;
+  provisionNetlify: boolean;
   provisionResend: boolean;
   provisionGitHub: boolean;
   provisionEnv: boolean;
@@ -36,7 +37,9 @@ interface CliArgs {
   cleanupNeon: boolean;
   cleanupCapRover: boolean;
   cleanupVercel: boolean;
+  cleanupNetlify: boolean;
   cleanupResend: boolean;
+  cleanupGitHub: boolean;
   interactive: boolean;
 
   // Cleanup filters
@@ -79,6 +82,7 @@ function parseArgs(): CliArgs {
     provisionNeon: args.includes('--provision-neon'),
     provisionCapRover: args.includes('--provision-caprover'),
     provisionVercel: args.includes('--provision-vercel'),
+    provisionNetlify: args.includes('--provision-netlify'),
     provisionResend: args.includes('--provision-resend'),
     provisionGitHub: args.includes('--provision-github'),
     provisionEnv: args.includes('--provision-env'),
@@ -87,7 +91,9 @@ function parseArgs(): CliArgs {
     cleanupNeon: args.includes('--cleanup-neon'),
     cleanupCapRover: args.includes('--cleanup-caprover'),
     cleanupVercel: args.includes('--cleanup-vercel'),
+    cleanupNetlify: args.includes('--cleanup-netlify'),
     cleanupResend: args.includes('--cleanup-resend'),
+    cleanupGitHub: args.includes('--cleanup-github'),
     interactive: args.includes('--interactive') || args.includes('-i'),
     project: getFlagValue('project'),
     filter: getFlagValue('filter'),
@@ -117,6 +123,7 @@ PROVISIONING OPTIONS:
   --provision-neon               Provision only Neon database
   --provision-caprover           Provision only CapRover backend hosting
   --provision-vercel             Provision only Vercel frontend hosting
+  --provision-netlify            Provision only Netlify frontend hosting
   --provision-resend             Provision only Resend email service
   --provision-github             Setup GitHub repository with CI/CD
   --provision-env                Generate .env files from 1Password
@@ -124,9 +131,11 @@ PROVISIONING OPTIONS:
 CLEANUP OPTIONS:
   --cleanup                      Cleanup all provisioned infrastructure (list-only by default)
   --cleanup-onepassword          Cleanup only 1Password vaults
+  --cleanup-github               Cleanup only GitHub repositories
   --cleanup-neon                 Cleanup only Neon databases
   --cleanup-caprover             Cleanup only CapRover apps
   --cleanup-vercel               Cleanup only Vercel projects
+  --cleanup-netlify              Cleanup only Netlify sites
   --cleanup-resend               Cleanup only Resend API keys
   --interactive, -i              Interactive checkbox selection (ONLY way to delete)
 
@@ -192,6 +201,7 @@ CAPROVER_URL="op://my-vault/CapRover/url"
 CAPROVER_PASSWORD="op://my-vault/CapRover/password"
 NEON_API_KEY="op://my-vault/Neon/api-key"
 VERCEL_TOKEN="op://my-vault/Vercel/token"
+NETLIFY_TOKEN="op://my-vault/Netlify/token"
 RESEND_API_KEY="op://my-vault/Resend/api-key"
 EOF
 
@@ -204,6 +214,7 @@ EOF
   export CAPROVER_PASSWORD="your-password"
   export NEON_API_KEY="your-neon-api-key"
   export VERCEL_TOKEN="your-vercel-token"
+  export NETLIFY_TOKEN="your-netlify-token"
   export RESEND_API_KEY="your-resend-api-key"
   npx provision-wasp-saas --provision
 
@@ -217,7 +228,7 @@ WHAT IT DOES:
   1. Creates 1Password vaults (dev + prod)
   2. Provisions Neon PostgreSQL database
   3. Provisions CapRover backend hosting
-  4. Provisions Vercel frontend hosting
+  4. Provisions Vercel or Netlify frontend hosting
   5. Provisions Resend email service
   6. Generates secrets and stores in 1Password
   7. (Optional) Creates GitHub repository with CI/CD workflows
@@ -231,6 +242,63 @@ For more information:
 function detectWaspProject(): boolean {
   const markers = ['main.wasp', '.wasproot'];
   return markers.some(file => fs.existsSync(path.join(process.cwd(), file)));
+}
+
+/**
+ * Detect the project name, handling the common Wasp "app" folder structure
+ * If running from an "app" folder with a git repo parent, use the parent folder name
+ */
+function detectProjectName(): string {
+  const cwd = process.cwd();
+  const currentDirName = path.basename(cwd);
+
+  // If not in an "app" folder, use current directory name
+  if (currentDirName !== 'app') {
+    return currentDirName;
+  }
+
+  // We're in an "app" folder - check if parent is a git repo
+  const parentDir = path.dirname(cwd);
+  const gitDir = path.join(parentDir, '.git');
+
+  if (!fs.existsSync(gitDir)) {
+    console.error('❌ Running from "app" folder but parent is not a git repository');
+    console.error('   Expected structure:');
+    console.error('   your-project/          <- git repo');
+    console.error('     app/                 <- current directory');
+    console.error('       main.wasp');
+    console.error('');
+    console.error('   Either:');
+    console.error('   1. Run from the parent directory that contains .git');
+    console.error('   2. Initialize a git repo in the parent: cd .. && git init');
+    process.exit(1);
+  }
+
+  // Get the GitHub repo name from git remote
+  try {
+    const remoteUrl = execSync('git -C ' + JSON.stringify(parentDir) + ' remote get-url origin', {
+      stdio: 'pipe',
+      encoding: 'utf-8'
+    }).trim();
+
+    // Extract repo name from various git URL formats:
+    // - https://github.com/user/repo.git
+    // - git@github.com:user/repo.git
+    // - https://github.com/user/repo
+    const match = remoteUrl.match(/[:/]([^/]+)\/([^/]+?)(\.git)?$/);
+    if (match) {
+      const repoName = match[2];
+      console.log(`✓ Detected project from parent git repo: ${repoName}`);
+      return repoName;
+    }
+  } catch (e) {
+    // No remote configured yet - that's okay, we'll use parent folder name
+  }
+
+  // Fall back to parent folder name
+  const parentName = path.basename(parentDir);
+  console.log(`✓ Using parent folder name as project: ${parentName}`);
+  return parentName;
 }
 
 async function main() {
@@ -252,15 +320,18 @@ async function main() {
     args.provisionNeon ||
     args.provisionCapRover ||
     args.provisionVercel ||
+    args.provisionNetlify ||
     args.provisionResend ||
     args.provisionGitHub ||
     args.provisionEnv;
 
   const hasCleanupFlag = args.cleanup ||
     args.cleanupOnePassword ||
+    args.cleanupGitHub ||
     args.cleanupNeon ||
     args.cleanupCapRover ||
     args.cleanupVercel ||
+    args.cleanupNetlify ||
     args.cleanupResend;
 
   if (!hasProvisionFlag && !hasCleanupFlag) {
@@ -313,15 +384,6 @@ async function main() {
     }
   }
 
-  // Check 1Password authentication
-  try {
-    execSync('op whoami', { stdio: 'ignore' });
-    if (args.verbose) console.log('✓ 1Password authenticated');
-  } catch {
-    console.error('❌ 1Password not authenticated. Run: op signin');
-    process.exit(1);
-  }
-
   console.log('');
 
   try {
@@ -332,13 +394,15 @@ async function main() {
 
       if (args.cleanup) {
         // Cleanup all components
-        components.push('onepassword', 'neon', 'caprover', 'vercel', 'resend');
+        components.push('onepassword', 'github', 'neon', 'caprover', 'vercel', 'netlify', 'resend');
       } else {
         // Selective cleanup
         if (args.cleanupOnePassword) components.push('onepassword');
+        if (args.cleanupGitHub) components.push('github');
         if (args.cleanupNeon) components.push('neon');
         if (args.cleanupCapRover) components.push('caprover');
         if (args.cleanupVercel) components.push('vercel');
+        if (args.cleanupNetlify) components.push('netlify');
         if (args.cleanupResend) components.push('resend');
       }
 
@@ -349,7 +413,7 @@ async function main() {
         projectName = args.project;
       } else if (isWaspProject) {
         // Auto-detect from directory if in Wasp project
-        projectName = path.basename(process.cwd());
+        projectName = detectProjectName();
       }
       // else: undefined (list all resources)
 
@@ -399,6 +463,9 @@ async function main() {
       console.log('🚀 Starting infrastructure provisioning...');
       console.log('');
 
+      // Detect project name
+      const projectName = detectProjectName();
+
       // Determine which components to provision
       let components: ProviderName[] | undefined;
       let includeGitHub = false;
@@ -417,6 +484,7 @@ async function main() {
         if (args.provisionNeon) components.push('neon');
         if (args.provisionCapRover) components.push('caprover');
         if (args.provisionVercel) components.push('vercel');
+        if (args.provisionNetlify) components.push('netlify');
         if (args.provisionResend) components.push('resend');
 
         includeGitHub = args.provisionGitHub;
@@ -434,6 +502,7 @@ async function main() {
         : [args.env];
 
       await provision({
+        projectName,
         components,
         includeGitHub,
         includeEnv,
