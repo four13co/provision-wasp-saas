@@ -6,6 +6,8 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setupServiceAccountAndSecrets, getGitHubOwner } from './service-account.js';
+import { RollbackAction } from './rollback.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -74,21 +76,19 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
 
-export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<void> {
+export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
   const { projectName, environments, verbose } = options;
+  const rollbackActions: RollbackAction[] = [];
 
-  // Get the script path relative to this module
-  const scriptPath = path.join(__dirname, '../scripts/op-service-account.sh');
+  // Get GitHub owner and construct repo full name
+  const owner = getGitHubOwner();
+  const repo = `${owner}/${projectName}`;
 
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`Service account script not found: ${scriptPath}`);
+  if (verbose) {
+    console.log(`  Setting up GitHub secrets for ${repo}...`);
   }
 
-  // Get GitHub username
-  const username = execSync('gh api user -q .login', { encoding: 'utf-8' }).trim();
-  const repoFullName = `${username}/${projectName}`;
-
-  // Create separate service account for each environment
+  // Create service account and GitHub secrets for each environment
   for (const env of environments) {
     const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
 
@@ -96,16 +96,27 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
       console.log(`  Creating service account for ${env}...`);
     }
 
-    execSync(
-      `bash ${scriptPath} ${repoFullName} ${vaultName} ${env}`,
-      { stdio: verbose ? 'inherit' : 'ignore' }
-    );
+    try {
+      const { rollbackActions: envRollback } = await setupServiceAccountAndSecrets({
+        projectName,
+        environment: env,
+        vaultName,
+        repo,
+        verbose
+      });
+
+      rollbackActions.push(...envRollback);
+    } catch (error: any) {
+      throw new Error(`Failed to setup service account for ${env}: ${error.message}`);
+    }
   }
 
   if (verbose) {
     console.log(`  ✓ Service accounts created (${environments.length})`);
     console.log('  ✓ GitHub secrets configured');
   }
+
+  return { rollbackActions };
 }
 
 export async function copyWorkflowTemplates(options: { projectName: string; verbose?: boolean }): Promise<void> {

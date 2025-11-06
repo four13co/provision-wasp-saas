@@ -168,7 +168,10 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
       if (!dryRun) {
         try {
           await createGitHubRepo({ projectName, verbose });
-          await setupGitHubSecrets({ projectName, environments, verbose });
+
+          const { rollbackActions: githubRollback } = await setupGitHubSecrets({ projectName, environments, verbose });
+          rollbackActions.push(...githubRollback);
+
           await copyWorkflowTemplates({ projectName, verbose });
           await copyScriptTemplates({ projectName, verbose });
 
