@@ -159,6 +159,59 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
 }
 
 /**
+ * Copy script templates to user's project
+ */
+export async function copyScriptTemplates(options: { projectName: string; verbose?: boolean }): Promise<void> {
+  const { projectName, verbose } = options;
+
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Create scripts directory at git root
+  const scriptsDir = path.join(gitRoot, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+
+  // Get template directory
+  const templatesDir = path.join(__dirname, '../templates/scripts');
+
+  if (!fs.existsSync(templatesDir)) {
+    throw new Error(`Script templates not found: ${templatesDir}`);
+  }
+
+  // Copy script files
+  const scripts = fs.readdirSync(templatesDir).filter(f => f.endsWith('.js'));
+
+  if (verbose) {
+    console.log(`  Copying scripts to: ${scriptsDir}`);
+  }
+
+  for (const script of scripts) {
+    const templatePath = path.join(templatesDir, script);
+    const targetPath = path.join(scriptsDir, script);
+
+    let content = fs.readFileSync(templatePath, 'utf-8');
+
+    // Replace placeholders if any (currently none, but keeping for consistency)
+    content = content.replace(/\{\{PROJECT_NAME\}\}/g, projectName);
+
+    fs.writeFileSync(targetPath, content);
+
+    if (verbose) console.log(`  ✓ Copied ${script}`);
+  }
+
+  if (!verbose) {
+    console.log(`  ✓ Copied ${scripts.length} script files to scripts/`);
+  }
+}
+
+/**
  * List all GitHub repositories for cleanup
  */
 export async function listGitHubInstances(

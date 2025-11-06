@@ -6,7 +6,7 @@
 import path from 'node:path';
 import { parseWaspEnv } from './wasp-parser.js';
 import { ensureOpAuth, opEnsureVault } from './op-util.js';
-import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates } from './github-provision.js';
+import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates, copyScriptTemplates } from './github-provision.js';
 import { emitEnvFiles } from './env-emit.js';
 import { provisionOnePassword } from './onepassword-provision.js';
 import { providers, resolveDependencies, getExecutionOrder, ProviderName, InfraProviderName } from './providers.js';
@@ -170,10 +170,12 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
           await createGitHubRepo({ projectName, verbose });
           await setupGitHubSecrets({ projectName, environments, verbose });
           await copyWorkflowTemplates({ projectName, verbose });
+          await copyScriptTemplates({ projectName, verbose });
 
           if (verbose) {
             console.log(`  ✓ GitHub repository configured`);
             console.log(`  ✓ Workflow templates copied`);
+            console.log(`  ✓ Script templates copied`);
           } else {
             console.log(`  ✓ GitHub: ${projectName}`);
           }
