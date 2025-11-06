@@ -7,9 +7,11 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opGetItem, opItemField, opEnsureVault, opReadRef } from './op-util.js';
+import { ensureOpAuth, opGetItem, opItemField, opEnsureVault, opReadRef, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { ProvisionOptions, CapRoverResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getCapRoverCredentials, getMissingCredentialsMessage } from './credentials.js';
+import { retry } from './retry-util.js';
 
 function sh(cmd: string, verbose?: boolean) {
   if (verbose) console.log(`$ ${cmd}`);
@@ -49,16 +51,17 @@ export async function provisionCapRover(
     };
   }
 
-  // Get CapRover credentials from environment variables
-  const url = process.env.CAPROVER_URL;
-  const password = process.env.CAPROVER_PASSWORD;
+  // Get credentials from master vault or environment variables
+  const credentials = getCapRoverCredentials();
+  const url = credentials.url;
+  const password = credentials.password;
 
   if (!url) {
-    throw new Error('CAPROVER_URL not set. Add to .env file:\n  CAPROVER_URL=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('caprover') + '\nSpecifically missing: CAPROVER_URL');
   }
 
   if (!password) {
-    throw new Error('CAPROVER_PASSWORD not set. Add to .env file:\n  CAPROVER_PASSWORD=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('caprover') + '\nSpecifically missing: CAPROVER_PASSWORD');
   }
 
   const base = apiBase(url);
@@ -256,21 +259,43 @@ export async function provisionCapRover(
       ensureOpAuth();
       opEnsureVault(vaultName);
 
-      const put = (title: string, field: 'username' | 'password', value: string) => {
-        if (!value) return;
-        try {
-          sh(`op item get --vault "${vaultName}" "${title}"`, verbose);
-        } catch {
-          sh(`op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local`, verbose);
+      // Create CapRover item with sections
+      const caproverSections: ItemSection[] = [
+        {
+          label: 'Application',
+          fields: [
+            { label: 'app_name', value: appName, type: 'STRING' }
+          ]
+        },
+        {
+          label: 'Server',
+          fields: [
+            { label: 'url', value: url, type: 'URL' }
+          ]
         }
-        const esc = value.replace(/'/g, "'\\''");
-        sh(`op item edit --vault "${vaultName}" "${title}" ${field}='${esc}'`, verbose);
-      };
+      ];
 
-      put('CAPROVER_URL', 'username', url);
-      put('CAPROVER_APP_NAME', 'username', appName);
-      if (appToken) put('CAPROVER_APP_TOKEN', 'password', appToken);
-      if (apiUrl) put('API_URL', 'username', apiUrl);
+      // Add deployment token if available
+      if (appToken) {
+        caproverSections.push({
+          label: 'Deployment',
+          fields: [
+            { label: 'app_token', value: appToken, type: 'CONCEALED' }
+          ]
+        });
+      }
+
+      // Add API URL if available
+      if (apiUrl) {
+        caproverSections.push({
+          label: 'URLs',
+          fields: [
+            { label: 'api_url', value: apiUrl, type: 'URL' }
+          ]
+        });
+      }
+
+      opEnsureItemWithSections(vaultName, 'CapRover', caproverSections, undefined, verbose);
 
       if (verbose) {
         console.log(`  ✓ Wrote CapRover details to 1Password vault: ${vaultName}`);

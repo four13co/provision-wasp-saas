@@ -16,8 +16,13 @@ import { provision } from './provision.js';
 import { ProviderName, cleanupRegistry } from './providers.js';
 import { cleanup } from './cleanup.js';
 import { checkConfig } from './check-config.js';
+import { initCommand } from './init-command.js';
 
 interface CliArgs {
+  // Tool commands
+  init: boolean;
+  checkConfig: boolean;
+
   // Full provisioning
   provision: boolean;
 
@@ -54,7 +59,6 @@ interface CliArgs {
   verbose: boolean;
   help: boolean;
   dryRun: boolean;
-  checkConfig: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -64,7 +68,18 @@ function parseArgs(): CliArgs {
   const getFlagValue = (flag: string): string | undefined => {
     const arg = args.find(a => a.startsWith(`--${flag}`));
     if (arg) {
-      return arg.split('=')[1] || args[args.indexOf(arg) + 1];
+      // Check if value is provided with = syntax
+      const eqValue = arg.split('=')[1];
+      if (eqValue !== undefined) {
+        return eqValue;
+      }
+
+      // Check next argument, but don't consume other flags
+      const nextIndex = args.indexOf(arg) + 1;
+      const nextArg = args[nextIndex];
+      if (nextArg && !nextArg.startsWith('-')) {
+        return nextArg;
+      }
     }
     return undefined;
   };
@@ -77,6 +92,8 @@ function parseArgs(): CliArgs {
   }
 
   return {
+    init: args.includes('init') || args.includes('--init'),
+    checkConfig: args.includes('--check-config'),
     provision: args.includes('--provision'),
     provisionOnePassword: args.includes('--provision-onepassword') || args.includes('--provision-1password'),
     provisionNeon: args.includes('--provision-neon'),
@@ -101,8 +118,7 @@ function parseArgs(): CliArgs {
     env,
     verbose: args.includes('--verbose') || args.includes('-v'),
     help: args.includes('--help') || args.includes('-h'),
-    dryRun: args.includes('--dry-run'),
-    checkConfig: args.includes('--check-config')
+    dryRun: args.includes('--dry-run')
   };
 }
 
@@ -113,8 +129,15 @@ provision-wasp-saas
 Infrastructure provisioning for Wasp/OpenSaaS projects.
 
 USAGE:
+  # First time setup - configure credentials
+  npx provision-wasp-saas init
+
+  # Then provision infrastructure
   cd my-wasp-app
   npx provision-wasp-saas [options]
+
+SETUP COMMANDS:
+  init                           Set up infrastructure credentials in 1Password vault
 
 PROVISIONING OPTIONS:
   --provision                    Run full infrastructure provisioning (all components)
@@ -234,6 +257,35 @@ WHAT IT DOES:
   7. (Optional) Creates GitHub repository with CI/CD workflows
   8. (Optional) Generates .env files from 1Password
 
+1PASSWORD VAULT STRUCTURE:
+  After provisioning, secrets are organized in a hierarchical structure:
+
+  op://my-project-prod/Auth/Secrets/jwt_secret
+  op://my-project-prod/Neon/Database/database_url
+  op://my-project-prod/Neon/Database/project_id
+  op://my-project-prod/Neon/Connection/postgres_host
+  op://my-project-prod/CapRover/Application/app_name
+  op://my-project-prod/CapRover/Server/url
+  op://my-project-prod/CapRover/Deployment/app_token
+  op://my-project-prod/CapRover/URLs/api_url
+  op://my-project-prod/Vercel/Project/project_id
+  op://my-project-prod/Vercel/Credentials/token
+  op://my-project-prod/Vercel/URLs/app_url
+  op://my-project-prod/Netlify/Site/site_id
+  op://my-project-prod/Netlify/Credentials/token
+  op://my-project-prod/Netlify/URLs/app_url
+  op://my-project-prod/Resend/Credentials/api_key
+  op://my-project-prod/Resend/Configuration/email_from
+
+  Each service is organized as:
+  - Item name (e.g., "Neon", "CapRover", "Vercel")
+  - Sections (e.g., "Database", "Credentials", "URLs")
+  - Fields (e.g., "database_url", "api_key", "app_url")
+
+  Use these references in your .env files with op run:
+  DATABASE_URL="op://my-project-prod/Neon/Database/database_url"
+  JWT_SECRET="op://my-project-prod/Auth/Secrets/jwt_secret"
+
 For more information:
   https://github.com/gregflint/provision-wasp-saas
 `);
@@ -311,6 +363,11 @@ async function main() {
 
   if (args.checkConfig) {
     await checkConfig(args.verbose);
+    process.exit(0);
+  }
+
+  if (args.init) {
+    await initCommand({ verbose: args.verbose });
     process.exit(0);
   }
 

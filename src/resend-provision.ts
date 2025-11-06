@@ -5,9 +5,11 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault } from './op-util.js';
+import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { ProvisionOptions, ResendResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getResendCredentials, getMissingCredentialsMessage } from './credentials.js';
+import { retryFetch } from './retry-util.js';
 
 function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
   if (opts.capture) {
@@ -25,10 +27,11 @@ function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
 }
 
 function getResendMasterKey(): string {
-  const key = process.env.RESEND_API_KEY || process.env.RESEND_MASTER_KEY;
+  const credentials = getResendCredentials();
+  const key = credentials.apiKey;
 
   if (!key) {
-    throw new Error('RESEND_API_KEY not set. Add to .env file:\n  RESEND_API_KEY=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('resend') + '\nSpecifically missing: RESEND_API_KEY');
   }
 
   return key;
@@ -67,23 +70,25 @@ export async function provisionResend(
   const masterKey = getResendMasterKey();
 
   try {
-    // Create API key via Resend API
-    const response = await fetch('https://api.resend.com/api-keys', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${masterKey}`,
-        'Content-Type': 'application/json'
+    // Create API key via Resend API with retry logic
+    const response = await retryFetch(
+      'https://api.resend.com/api-keys',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${masterKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: keyName,
+          permission: 'sending_access'
+        })
       },
-      body: JSON.stringify({
-        name: keyName,
-        permission: 'sending_access'
-      })
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Resend API error (${response.status}): ${errorText}`);
-    }
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     const data = await response.json() as { id: string; token: string };
 
@@ -98,12 +103,19 @@ export async function provisionResend(
         `Delete Resend API key ${keyName} (${data.id})`,
         async () => {
           try {
-            await fetch(`https://api.resend.com/api-keys/${data.id}`, {
-              method: 'DELETE',
-              headers: {
-                'Authorization': `Bearer ${masterKey}`
+            await retryFetch(
+              `https://api.resend.com/api-keys/${data.id}`,
+              {
+                method: 'DELETE',
+                headers: {
+                  'Authorization': `Bearer ${masterKey}`
+                }
+              },
+              {
+                maxRetries: 2,
+                verbose: false
               }
-            });
+            );
 
             if (verbose) {
               console.log(`    Deleted Resend API key ${data.id}`);
@@ -120,28 +132,29 @@ export async function provisionResend(
       ensureOpAuth();
       opEnsureVault(vaultName);
 
-      // Create or update RESEND item
-      try {
-        sh(`op item get --vault "${vaultName}" RESEND`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "RESEND" --url=local`, { verbose });
-      }
-
-      const keyIdField = envSuffix === 'prod' ? 'RESEND_API_KEY_PROD_ID' : 'RESEND_API_KEY_DEV_ID';
-      const keyTokenField = envSuffix === 'prod' ? 'RESEND_API_KEY_PROD' : 'RESEND_API_KEY_DEV';
-
-      sh(`op item edit --vault "${vaultName}" RESEND ${keyIdField}=${data.id}`, { verbose });
-      sh(`op item edit --vault "${vaultName}" RESEND ${keyTokenField}="${data.token}"`, { verbose });
-
-      // Store active key for current environment
-      sh(`op item edit --vault "${vaultName}" RESEND RESEND_API_KEY="${data.token}"`, { verbose });
-
-      // Store EMAIL_FROM for current environment
+      // Compute email from address
       const emailFrom = envSuffix === 'prod'
         ? `no-reply@${projectName}.com`
         : `no-reply@dev.${projectName}.com`;
 
-      sh(`op item edit --vault "${vaultName}" RESEND EMAIL_FROM="${emailFrom}"`, { verbose });
+      // Create Resend item with sections
+      const resendSections: ItemSection[] = [
+        {
+          label: 'Credentials',
+          fields: [
+            { label: 'api_key_id', value: data.id, type: 'STRING' },
+            { label: 'api_key', value: data.token, type: 'CONCEALED' }
+          ]
+        },
+        {
+          label: 'Configuration',
+          fields: [
+            { label: 'email_from', value: emailFrom, type: 'EMAIL' }
+          ]
+        }
+      ];
+
+      opEnsureItemWithSections(vaultName, 'Resend', resendSections, undefined, verbose);
 
       if (verbose) {
         console.log(`  ✓ Wrote Resend details to 1Password vault: ${vaultName}`);
@@ -187,13 +200,16 @@ export async function listResendInstances(
   }
 
   try {
-    const resp = await fetch('https://api.resend.com/api-keys', {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
-
-    if (!resp.ok) {
-      throw new Error(`Failed to list Resend API keys: HTTP ${resp.status}`);
-    }
+    const resp = await retryFetch(
+      'https://api.resend.com/api-keys',
+      {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     const data: any = await resp.json();
     const keys = data?.data || [];
@@ -269,20 +285,17 @@ export async function deleteResendInstance(
   }
 
   try {
-    const resp = await fetch(`https://api.resend.com/api-keys/${instanceId}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
-
-    if (!resp.ok) {
-      const errorData: any = await resp.json().catch(() => ({}));
-      return {
-        id: instanceId,
-        name: instanceId,
-        success: false,
-        error: errorData?.message || `HTTP ${resp.status}`
-      };
-    }
+    await retryFetch(
+      `https://api.resend.com/api-keys/${instanceId}`,
+      {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     if (verbose) {
       console.log(`    Deleted Resend API key ${instanceId}`);

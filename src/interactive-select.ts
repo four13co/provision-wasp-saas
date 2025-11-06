@@ -42,7 +42,7 @@ export async function selectResources(
       message: `Select ${component} resources to delete`,
       choices,
       pageSize: 15,
-      instructions: '\n  Navigate: ↑↓  |  Select: Space  |  All: Ctrl+A  |  Confirm: Enter\n',
+      instructions: '\n  Navigate: ↑↓  |  Select: Space  |  All: Ctrl+A  |  Confirm: Enter  |  Exit: Esc\n',
       loop: false,
       required: false
     });
@@ -70,21 +70,27 @@ export async function selectResources(
     }
 
     // Confirmation
-    const confirmed = await confirm({
-      message: `Are you SURE you want to delete these ${selected.length} resource(s)?`,
-      default: false
-    });
+    try {
+      const confirmed = await confirm({
+        message: `Are you SURE you want to delete these ${selected.length} resource(s)?`,
+        default: false
+      });
 
-    if (!confirmed) {
-      console.log('  Deletion cancelled');
-      return { selected: [], cancelled: true };
+      if (!confirmed) {
+        console.log('  Deletion cancelled');
+        return { selected: [], cancelled: true };
+      }
+    } catch (confirmError) {
+      // Handle Escape/Ctrl+C during confirmation - exit the program
+      console.log('\n  Operation cancelled');
+      process.exit(0);
     }
 
     return { selected, cancelled: false };
 
   } catch (error) {
-    // Handle Ctrl+C or other cancellation
+    // Handle Escape/Ctrl+C - exit the program cleanly
     console.log('\n  Operation cancelled');
-    return { selected: [], cancelled: true };
+    process.exit(0);
   }
 }

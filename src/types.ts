@@ -78,6 +78,42 @@ export interface ResendResult {
 }
 
 /**
+ * Result returned from Stripe payment provisioning
+ */
+export interface StripeResult {
+  apiKey: string;
+  webhookSecret: string;
+  customerPortalUrl?: string;
+  hobbyPlanId?: string;
+  proPlanId?: string;
+}
+
+/**
+ * Result returned from SendGrid email provisioning
+ */
+export interface SendGridResult {
+  apiKey: string;
+}
+
+/**
+ * Result returned from AWS S3 provisioning
+ */
+export interface AwsS3Result {
+  accessKey: string;
+  secretKey: string;
+  bucketName: string;
+  region: string;
+}
+
+/**
+ * Result returned from Google OAuth provisioning
+ */
+export interface GoogleOAuthResult {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
  * Options for 1Password vault provisioning
  */
 export interface OnePasswordOptions {

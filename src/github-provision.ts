@@ -5,6 +5,11 @@
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export interface GitHubRepoOptions {
   projectName: string;
@@ -13,8 +18,7 @@ export interface GitHubRepoOptions {
 
 export interface GitHubSecretsOptions {
   projectName: string;
-  vaultDev: string;
-  vaultProd: string;
+  environments: Array<'dev' | 'prod'>;
   verbose?: boolean;
 }
 
@@ -38,29 +42,40 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
 
   if (verbose) console.log(`  Created repository: ${projectName}`);
 
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
   // Initialize git if not already initialized
-  if (!fs.existsSync('.git')) {
-    execSync('git init', { stdio: verbose ? 'inherit' : 'ignore' });
-    execSync('git branch -M Development', { stdio: verbose ? 'inherit' : 'ignore' });
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    execSync('git init', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
+    execSync('git branch -M Development', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
   }
 
   // Add remote
   try {
     execSync(`git remote add origin https://github.com/$(gh api user -q .login)/${projectName}.git`, {
-      stdio: verbose ? 'inherit' : 'ignore'
+      stdio: verbose ? 'inherit' : 'ignore',
+      cwd: gitRoot
     });
   } catch {
     // Remote might already exist
   }
 
   // Create Production branch reference
-  execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore' });
+  execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
 
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
 
 export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<void> {
-  const { projectName, vaultDev, vaultProd, verbose } = options;
+  const { projectName, environments, verbose } = options;
 
   // Get the script path relative to this module
   const scriptPath = path.join(__dirname, '../scripts/op-service-account.sh');
@@ -69,26 +84,45 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
     throw new Error(`Service account script not found: ${scriptPath}`);
   }
 
-  // Run the service account creation script
+  // Get GitHub username
   const username = execSync('gh api user -q .login', { encoding: 'utf-8' }).trim();
   const repoFullName = `${username}/${projectName}`;
 
-  execSync(
-    `bash ${scriptPath} ${repoFullName} ${vaultDev} ${vaultProd}`,
-    { stdio: verbose ? 'inherit' : 'ignore' }
-  );
+  // Create separate service account for each environment
+  for (const env of environments) {
+    const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+    if (verbose) {
+      console.log(`  Creating service account for ${env}...`);
+    }
+
+    execSync(
+      `bash ${scriptPath} ${repoFullName} ${vaultName} ${env}`,
+      { stdio: verbose ? 'inherit' : 'ignore' }
+    );
+  }
 
   if (verbose) {
-    console.log('  Service account created');
-    console.log('  GitHub secrets configured');
+    console.log(`  ✓ Service accounts created (${environments.length})`);
+    console.log('  ✓ GitHub secrets configured');
   }
 }
 
 export async function copyWorkflowTemplates(options: { projectName: string; verbose?: boolean }): Promise<void> {
   const { projectName, verbose } = options;
 
-  // Create .github/workflows directory
-  const workflowsDir = path.join(process.cwd(), '.github', 'workflows');
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Create .github/workflows directory at git root
+  const workflowsDir = path.join(gitRoot, '.github', 'workflows');
   fs.mkdirSync(workflowsDir, { recursive: true });
 
   // Get template directory
@@ -101,6 +135,10 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
   // Copy and customize workflow files
   const templates = fs.readdirSync(templatesDir).filter(f => f.endsWith('.yml'));
 
+  if (verbose) {
+    console.log(`  Copying workflows to: ${workflowsDir}`);
+  }
+
   for (const template of templates) {
     const templatePath = path.join(templatesDir, template);
     const targetPath = path.join(workflowsDir, template);
@@ -112,7 +150,11 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
 
     fs.writeFileSync(targetPath, content);
 
-    if (verbose) console.log(`  Copied ${template}`);
+    if (verbose) console.log(`  ✓ Copied ${template}`);
+  }
+
+  if (!verbose) {
+    console.log(`  ✓ Copied ${templates.length} workflow files to .github/workflows/`);
   }
 }
 

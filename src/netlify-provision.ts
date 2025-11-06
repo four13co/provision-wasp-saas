@@ -6,9 +6,11 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opEnsureVault } from './op-util.js';
+import { ensureOpAuth, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { ProvisionOptions, NetlifyResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getNetlifyCredentials, getMissingCredentialsMessage } from './credentials.js';
+import { retryFetch } from './retry-util.js';
 
 function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
   if (opts.capture) {
@@ -26,10 +28,11 @@ function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
 }
 
 function getNetlifyToken(): string {
-  const token = process.env.NETLIFY_TOKEN;
+  const credentials = getNetlifyCredentials();
+  const token = credentials.token;
 
   if (!token) {
-    throw new Error('NETLIFY_TOKEN not set. Add to .env file:\n  NETLIFY_TOKEN=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('netlify') + '\nSpecifically missing: NETLIFY_TOKEN');
   }
 
   return token;
@@ -178,28 +181,30 @@ export async function provisionNetlify(
       ensureOpAuth();
       opEnsureVault(vaultName);
 
-      // Create or update NETLIFY item
-      try {
-        sh(`op item get --vault "${vaultName}" NETLIFY`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "NETLIFY" --url=local`, { verbose });
-      }
+      // Create Netlify item with sections
+      const netlifySections: ItemSection[] = [
+        {
+          label: 'Site',
+          fields: [
+            { label: 'site_id', value: siteId, type: 'STRING' },
+            { label: 'site_name', value: netlifySiteName, type: 'STRING' }
+          ]
+        },
+        {
+          label: 'Credentials',
+          fields: [
+            { label: 'token', value: token, type: 'CONCEALED' }
+          ]
+        },
+        {
+          label: 'URLs',
+          fields: [
+            { label: 'app_url', value: siteUrl, type: 'URL' }
+          ]
+        }
+      ];
 
-      const siteIdField = envSuffix === 'prod' ? 'NETLIFY_SITE_ID_PROD' : 'NETLIFY_SITE_ID_DEV';
-      const siteNameField = envSuffix === 'prod' ? 'NETLIFY_SITE_NAME_PROD' : 'NETLIFY_SITE_NAME_DEV';
-
-      sh(`op item edit --vault "${vaultName}" NETLIFY ${siteIdField}=${siteId}`, { verbose });
-      sh(`op item edit --vault "${vaultName}" NETLIFY ${siteNameField}=${netlifySiteName}`, { verbose });
-      sh(`op item edit --vault "${vaultName}" NETLIFY NETLIFY_TOKEN=${token}`, { verbose });
-
-      // Store APP_URL
-      try {
-        sh(`op item get --vault "${vaultName}" APP_URL`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "APP_URL" --url=local`, { verbose });
-      }
-
-      sh(`op item edit --vault "${vaultName}" APP_URL username='${siteUrl}'`, { verbose });
+      opEnsureItemWithSections(vaultName, 'Netlify', netlifySections, undefined, verbose);
 
       if (verbose) {
         console.log(`  ✓ Wrote Netlify details to 1Password vault: ${vaultName}`);
@@ -245,13 +250,16 @@ export async function listNetlifyInstances(
   }
 
   try {
-    const resp = await fetch('https://api.netlify.com/api/v1/sites', {
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-
-    if (!resp.ok) {
-      throw new Error(`Failed to list Netlify sites: HTTP ${resp.status}`);
-    }
+    const resp = await retryFetch(
+      'https://api.netlify.com/api/v1/sites',
+      {
+        headers: { 'Authorization': `Bearer ${token}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     const sites = await resp.json() as any[];
 
@@ -328,20 +336,17 @@ export async function deleteNetlifyInstance(
   }
 
   try {
-    const resp = await fetch(`https://api.netlify.com/api/v1/sites/${instanceId}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-
-    if (!resp.ok) {
-      const errorData: any = await resp.json().catch(() => ({}));
-      return {
-        id: instanceId,
-        name: instanceId,
-        success: false,
-        error: errorData?.message || `HTTP ${resp.status}`
-      };
-    }
+    await retryFetch(
+      `https://api.netlify.com/api/v1/sites/${instanceId}`,
+      {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     if (verbose) {
       console.log(`    Deleted Netlify site ${instanceId}`);

@@ -1,37 +1,18 @@
 /**
  * 1Password vault provisioning
  * - Creates project vault
- * - Seeds required secrets (JWT_SECRET, placeholders for providers)
+ * - Creates Auth item with JWT_SECRET
  */
 
 import { execSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { ensureOpAuth, opEnsureVault } from './op-util.js';
+import { ensureOpAuth, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { OnePasswordOptions, OnePasswordResult } from './types.js';
 import { RollbackAction } from './rollback.js';
 
 function sh(cmd: string, verbose?: boolean) {
   if (verbose) console.log(`$ ${cmd}`);
   execSync(cmd, { stdio: verbose ? 'inherit' : 'ignore' });
-}
-
-function setSecret(vaultName: string, title: string, value?: string, verbose?: boolean) {
-  try {
-    sh(`op item get --vault "${vaultName}" "${title}"`, verbose);
-  } catch {
-    if (value) {
-      const esc = value.replace(/'/g, "'\\''");
-      sh(
-        `op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local password='${esc}'`,
-        verbose
-      );
-    } else {
-      sh(
-        `op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local`,
-        verbose
-      );
-    }
-  }
 }
 
 /**
@@ -57,47 +38,37 @@ export async function provisionOnePassword(
 
   try {
     ensureOpAuth();
-    opEnsureVault(vaultName);
+    const vaultResult = opEnsureVault(vaultName, verbose);
 
-    if (verbose) {
-      console.log(`  ✓ Created vault: ${vaultName}`);
+    if (!verbose) {
+      // Only show simple message if not verbose (verbose mode already showed details)
+      if (vaultResult.existed) {
+        console.log(`  ✓ Using existing vault: ${vaultName}`);
+      } else {
+        console.log(`  ✓ Created vault: ${vaultName}`);
+      }
     }
 
-    // Generate and store JWT secret
+    // Generate and store JWT secret in Auth item
     const jwtSecret = crypto.randomBytes(32).toString('hex');
-    setSecret(vaultName, 'JWT_SECRET', jwtSecret, verbose);
 
-    if (verbose) {
-      console.log(`  ✓ Generated JWT_SECRET`);
-    }
-
-    // Create placeholder items for provider-populated secrets
-    const placeholders = [
-      'DATABASE_URL',
-      'RESEND_API_KEY',
-      'POSTHOG_API_KEY',
-      'AWS_S3_IAM_ACCESS_KEY',
-      'AWS_S3_IAM_SECRET_KEY',
-      'AWS_S3_REGION',
-      'AWS_S3_BUCKET_NAME',
-      'S3_ENDPOINT',
-      'REDIS_URL',
-      'QDRANT_HOST',
-      'QDRANT_PORT',
-      'QDRANT_API_KEY',
-      'OPENAI_API_KEY',
-      'NETLIFY_SITE_ID',
-      'CAPROVER_APP_NAME',
-      'API_URL',
-      'APP_URL'
+    const authSections: ItemSection[] = [
+      {
+        label: 'Secrets',
+        fields: [
+          {
+            label: 'jwt_secret',
+            value: jwtSecret,
+            type: 'CONCEALED'
+          }
+        ]
+      }
     ];
 
-    for (const placeholder of placeholders) {
-      setSecret(vaultName, placeholder, undefined, verbose);
-    }
+    opEnsureItemWithSections(vaultName, 'Auth', authSections, undefined, verbose);
 
     if (verbose) {
-      console.log(`  ✓ Created ${placeholders.length} placeholder items`);
+      console.log(`  ✓ Created Auth item with JWT secret`);
       console.log(`  ✓ 1Password vault provisioned: ${vaultName}`);
     } else {
       console.log(`  ✓ 1Password: ${vaultName}`);

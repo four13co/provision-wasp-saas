@@ -1,34 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Creates a 1Password Service Account for this repo, grants read-only access
-# to the per-project vaults (dev/prod), and stores the token in GitHub secrets.
+# Creates a 1Password Service Account for a specific environment (dev or prod),
+# grants read-only access to the environment vault, and stores the token in GitHub secrets.
 #
 # Requirements:
 # - op CLI authenticated with an admin capable of creating service accounts
 # - gh CLI authenticated with repo admin rights
-# - jq available (for JSON parsing)
 #
 # Usage:
-#   ./scripts/op-service-account.sh <owner/repo> [project-dev] [project-prod]
+#   ./scripts/op-service-account.sh <owner/repo> <vault-name> <env-suffix>
+#
+# Example:
+#   ./scripts/op-service-account.sh gregflint/myapp myapp-prod prod
 #
 
 get_next_version() {
-  local repo_name="$1"
   date +%Y%m%d%H%M%S
 }
 
 OWNER_REPO=${1:-${GITHUB_REPOSITORY:-"example/sample"}}
-REPO_NAME="${OWNER_REPO#*/}"
-VAULT_DEV=${2:-"${REPO_NAME}-dev"}
-VAULT_PROD=${3:-"${REPO_NAME}-prod"}
-VERSION=$(get_next_version "$REPO_NAME")
-SA_NAME="${REPO_NAME}-sa-v${VERSION}"
+VAULT_NAME=${2:?"Vault name is required"}
+ENV_SUFFIX=${3:?"Environment suffix (dev/prod) is required"}
 
-echo "Repo      : $OWNER_REPO"
-echo "Vault Dev : $VAULT_DEV"
-echo "Vault Prod: $VAULT_PROD"
-echo "SA Name   : $SA_NAME"
+REPO_NAME="${OWNER_REPO#*/}"
+VERSION=$(get_next_version "$REPO_NAME")
+SA_NAME="${REPO_NAME}-sa-${ENV_SUFFIX}-v${VERSION}"
+
+# Convert env suffix to uppercase for secret names
+ENV_UPPER=$(echo "$ENV_SUFFIX" | tr '[:lower:]' '[:upper:]')
+
+echo "Repo         : $OWNER_REPO"
+echo "Vault        : $VAULT_NAME"
+echo "Environment  : $ENV_SUFFIX"
+echo "SA Name      : $SA_NAME"
 
 if ! command -v op >/dev/null 2>&1; then
   echo "op CLI not found. Install 1Password CLI v2 and sign in." >&2
@@ -36,10 +41,6 @@ if ! command -v op >/dev/null 2>&1; then
 fi
 if ! command -v gh >/dev/null 2>&1; then
   echo "gh CLI not found. Install GitHub CLI and authenticate (gh auth login)." >&2
-  exit 1
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq not found. Please install jq to parse JSON." >&2
   exit 1
 fi
 
@@ -50,11 +51,11 @@ if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
   SA_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN"
 else
   SA_TOKEN=$(op service-account create "$SA_NAME" \
-    --vault "$VAULT_DEV:read_items" \
-    --vault "$VAULT_PROD:read_items" \
+    --vault "$VAULT_NAME:read_items" \
     --raw 2>/dev/null)
 fi
 set -e
+
 if [ -z "$SA_TOKEN" ]; then
   cat >&2 <<EOF
 Failed to create service account or retrieve token.
@@ -64,11 +65,10 @@ EOF
   exit 1
 fi
 
-# Grants were applied at creation using --vault flags.
+# Store environment-specific secrets in GitHub
+echo "Storing secrets in GitHub..."
+gh secret set "OP_SERVICE_ACCOUNT_TOKEN_${ENV_UPPER}" --repo "$OWNER_REPO" --body "$SA_TOKEN"
+gh secret set "OP_VAULT_${ENV_UPPER}" --repo "$OWNER_REPO" --body "$VAULT_NAME"
 
-echo "Storing token in GitHub secrets..."
-gh secret set OP_SERVICE_ACCOUNT_TOKEN --repo "$OWNER_REPO" --body "$SA_TOKEN"
-gh secret set OP_VAULT_DEV --repo "$OWNER_REPO" --body "$VAULT_DEV"
-gh secret set OP_VAULT_PROD --repo "$OWNER_REPO" --body "$VAULT_PROD"
-
-echo "Done. Service account created and GitHub secrets updated for $OWNER_REPO"
+echo "Done. Service account '$SA_NAME' created for $ENV_SUFFIX environment"
+echo "GitHub secrets: OP_SERVICE_ACCOUNT_TOKEN_${ENV_UPPER}, OP_VAULT_${ENV_UPPER}"

@@ -6,82 +6,10 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install Wasp
-        run: curl -sSL https://get.wasp-lang.dev/installer.sh | sh
-
-      - name: Load secrets from 1Password
-        uses: 1password/load-secrets-action@v2
-        with:
-          export-env: true
-        env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          DATABASE_URL: op://{{PROJECT_NAME}}-dev/DATABASE_URL/password
-          JWT_SECRET: op://{{PROJECT_NAME}}-dev/JWT_SECRET/password
-          STRIPE_API_KEY: op://{{PROJECT_NAME}}-dev/STRIPE/STRIPE_API_KEY
-          STRIPE_WEBHOOK_SECRET: op://{{PROJECT_NAME}}-dev/STRIPE/STRIPE_WEBHOOK_SECRET
-          SENDGRID_API_KEY: op://{{PROJECT_NAME}}-dev/SENDGRID/SENDGRID_API_KEY
-          AWS_S3_IAM_ACCESS_KEY: op://{{PROJECT_NAME}}-dev/AWS/AWS_S3_IAM_ACCESS_KEY
-          AWS_S3_IAM_SECRET_KEY: op://{{PROJECT_NAME}}-dev/AWS/AWS_S3_IAM_SECRET_KEY
-          AWS_S3_FILES_BUCKET: op://{{PROJECT_NAME}}-dev/AWS/AWS_S3_FILES_BUCKET
-          CAPROVER_URL: op://{{PROJECT_NAME}}-dev/CAPROVER_URL/username
-          CAPROVER_APP_TOKEN: op://{{PROJECT_NAME}}-dev/CAPROVER_APP_TOKEN/password
-          VERCEL_TOKEN: op://{{PROJECT_NAME}}-dev/VERCEL/VERCEL_TOKEN
-          VERCEL_PROJECT_ID: op://{{PROJECT_NAME}}-dev/VERCEL/VERCEL_PROJECT_ID_DEV
-          VERCEL_ORG_ID: op://{{PROJECT_NAME}}-dev/VERCEL/VERCEL_ORG_ID
-
-      - name: Build .env.server
-        run: |
-          set -euo pipefail
-          {
-            [ -n "${DATABASE_URL:-}" ] && echo "DATABASE_URL=$DATABASE_URL" || true
-            [ -n "${JWT_SECRET:-}" ] && echo "JWT_SECRET=$JWT_SECRET" || true
-            [ -n "${STRIPE_API_KEY:-}" ] && echo "STRIPE_API_KEY=$STRIPE_API_KEY" || true
-            [ -n "${STRIPE_WEBHOOK_SECRET:-}" ] && echo "STRIPE_WEBHOOK_SECRET=$STRIPE_WEBHOOK_SECRET" || true
-            [ -n "${SENDGRID_API_KEY:-}" ] && echo "SENDGRID_API_KEY=$SENDGRID_API_KEY" || true
-            [ -n "${AWS_S3_IAM_ACCESS_KEY:-}" ] && echo "AWS_S3_IAM_ACCESS_KEY=$AWS_S3_IAM_ACCESS_KEY" || true
-            [ -n "${AWS_S3_IAM_SECRET_KEY:-}" ] && echo "AWS_S3_IAM_SECRET_KEY=$AWS_S3_IAM_SECRET_KEY" || true
-            [ -n "${AWS_S3_FILES_BUCKET:-}" ] && echo "AWS_S3_FILES_BUCKET=$AWS_S3_FILES_BUCKET" || true
-          } > .env.server
-
-      - name: Build .env.client
-        run: |
-          set -euo pipefail
-          {
-            echo "# Client environment variables"
-          } > .env.client
-
-      - name: Build Wasp project
-        run: wasp build
-
-      - name: Deploy backend to CapRover
-        run: |
-          cd .wasp/build/server
-          tar -czf ../../../backend-deploy.tar.gz .
-          cd ../../..
-          npx --yes caprover@latest deploy \
-            --caproverUrl "$CAPROVER_URL" \
-            --appToken "$CAPROVER_APP_TOKEN" \
-            --appName "{{PROJECT_NAME}}-api-dev" \
-            --tarFile ./backend-deploy.tar.gz
-
-      - name: Deploy frontend to Vercel
-        working-directory: .wasp/build/web-app
-        run: npx vercel deploy --prod --token "$VERCEL_TOKEN" --yes
-        env:
-          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
-
-      - name: Run database migrations
-        run: |
-          export DATABASE_URL="${DATABASE_URL}"
-          wasp db migrate-deploy
+    uses: ./.github/workflows/deploy-reusable.yml
+    with:
+      environment: dev
+      app_name_suffix: -dev
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN_DEV }}
+      OP_VAULT: ${{ secrets.OP_VAULT_DEV }}

@@ -8,6 +8,10 @@ import { provisionCapRover, listCapRoverInstances, deleteCapRoverInstance } from
 import { provisionVercel, listVercelInstances, deleteVercelInstance } from './vercel-provision.js';
 import { provisionNetlify, listNetlifyInstances, deleteNetlifyInstance } from './netlify-provision.js';
 import { provisionResend, listResendInstances, deleteResendInstance } from './resend-provision.js';
+import { provisionStripe, listStripeInstances, deleteStripeInstance } from './stripe-provision.js';
+import { provisionSendGrid, listSendGridInstances, deleteSendGridInstance } from './sendgrid-provision.js';
+import { provisionAwsS3, listAwsS3Instances, deleteAwsS3Instance } from './aws-s3-provision.js';
+import { provisionGoogleOAuth, listGoogleOAuthInstances, deleteGoogleOAuthInstance } from './google-oauth-provision.js';
 import { listOnePasswordInstances, deleteOnePasswordInstance } from './onepassword-provision.js';
 import { listGitHubInstances, deleteGitHubInstance } from './github-provision.js';
 import { ProvisionOptions, CleanupOptions, ProviderInstance, DeleteInstanceResult } from './types.js';
@@ -15,7 +19,7 @@ import { ProvisionOptions, CleanupOptions, ProviderInstance, DeleteInstanceResul
 /**
  * Infrastructure provider names (excludes onepassword which has different signature)
  */
-export type InfraProviderName = 'neon' | 'caprover' | 'vercel' | 'netlify' | 'resend';
+export type InfraProviderName = 'neon' | 'caprover' | 'vercel' | 'netlify' | 'resend' | 'stripe' | 'sendgrid' | 'aws-s3' | 'google-oauth';
 
 /**
  * All provider names including onepassword and github
@@ -32,6 +36,10 @@ export interface ProviderRegistry {
   vercel: typeof provisionVercel;
   netlify: typeof provisionNetlify;
   resend: typeof provisionResend;
+  stripe: typeof provisionStripe;
+  sendgrid: typeof provisionSendGrid;
+  'aws-s3': typeof provisionAwsS3;
+  'google-oauth': typeof provisionGoogleOAuth;
 }
 
 /**
@@ -43,7 +51,11 @@ export const providers: ProviderRegistry = {
   caprover: provisionCapRover,
   vercel: provisionVercel,
   netlify: provisionNetlify,
-  resend: provisionResend
+  resend: provisionResend,
+  stripe: provisionStripe,
+  sendgrid: provisionSendGrid,
+  'aws-s3': provisionAwsS3,
+  'google-oauth': provisionGoogleOAuth
 };
 
 /**
@@ -85,6 +97,22 @@ export const cleanupRegistry: Record<ProviderName, CleanupFunctions> = {
   resend: {
     listInstances: listResendInstances,
     deleteInstance: deleteResendInstance
+  },
+  stripe: {
+    listInstances: listStripeInstances,
+    deleteInstance: deleteStripeInstance
+  },
+  sendgrid: {
+    listInstances: listSendGridInstances,
+    deleteInstance: deleteSendGridInstance
+  },
+  'aws-s3': {
+    listInstances: listAwsS3Instances,
+    deleteInstance: deleteAwsS3Instance
+  },
+  'google-oauth': {
+    listInstances: listGoogleOAuthInstances,
+    deleteInstance: deleteGoogleOAuthInstance
   }
 };
 
@@ -125,13 +153,29 @@ export const DEPENDENCIES: Record<string, ComponentDependencies> = {
     requires: ['onepassword'],
     optional: []
   },
+  'stripe': {
+    requires: ['onepassword'],
+    optional: []
+  },
+  'sendgrid': {
+    requires: ['onepassword'],
+    optional: []
+  },
+  'aws-s3': {
+    requires: ['onepassword'],
+    optional: []
+  },
+  'google-oauth': {
+    requires: ['onepassword'],
+    optional: []
+  },
   'github': {
     requires: ['onepassword'],
     optional: ['neon', 'caprover', 'vercel', 'netlify']
   },
   'env': {
     requires: ['onepassword'],
-    optional: ['neon', 'caprover', 'vercel', 'netlify', 'resend']
+    optional: ['neon', 'caprover', 'vercel', 'netlify', 'resend', 'stripe', 'sendgrid', 'aws-s3', 'google-oauth']
   }
 };
 
@@ -159,7 +203,7 @@ export function resolveDependencies(requested: ProviderName[]): ProviderName[] {
   }
 
   // Return in dependency order (foundational components first)
-  const order: ProviderName[] = ['onepassword', 'neon', 'caprover', 'vercel', 'netlify', 'resend'];
+  const order: ProviderName[] = ['onepassword', 'neon', 'caprover', 'vercel', 'netlify', 'resend', 'stripe', 'sendgrid', 'aws-s3', 'google-oauth'];
   return order.filter(c => resolved.has(c));
 }
 

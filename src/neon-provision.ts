@@ -5,10 +5,11 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opEnsureVault, opGetItem, opItemField, opReadRef } from './op-util.js';
+import { ensureOpAuth, opEnsureVault, opGetItem, opItemField, opReadRef, opReadField, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { createApiClient, ContentType } from '@neondatabase/api-client';
 import { ProvisionOptions, NeonResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getNeonCredentials, getMissingCredentialsMessage } from './credentials.js';
 
 function sh(
   cmd: string,
@@ -85,6 +86,60 @@ function pickConnectionString(obj: any): string {
 }
 
 /**
+ * Find an existing Neon project by name
+ * @returns Project object with id and optional connection details, or null if not found
+ */
+async function findExistingProject(
+  api: ReturnType<typeof createApiClient>,
+  name: string,
+  verbose?: boolean
+): Promise<{ id: string; databaseUrl?: string } | null> {
+  try {
+    const list: any = await neonApiRequest(api, '/projects', 'GET');
+    const arr = (list?.projects || list?.data || list) as any[];
+
+    if (!Array.isArray(arr)) {
+      return null;
+    }
+
+    const found = arr.find((p) => (p?.name || '').toLowerCase() === name.toLowerCase());
+
+    if (found?.id) {
+      if (verbose) {
+        console.log(`  Found existing Neon project: ${found.name} (${found.id})`);
+      }
+
+      // Try to extract database URL from project data
+      let databaseUrl = pickConnectionString(found) || '';
+
+      // If not in list response, try fetching project details
+      if (!databaseUrl) {
+        try {
+          const details = await neonApiRequest(api, `/projects/${found.id}`, 'GET');
+          databaseUrl = pickConnectionString(details) || '';
+        } catch (e: any) {
+          if (verbose) {
+            console.warn(`  Could not fetch project details: ${e?.message || e}`);
+          }
+        }
+      }
+
+      return {
+        id: found.id,
+        databaseUrl: databaseUrl || undefined
+      };
+    }
+
+    return null;
+  } catch (e: any) {
+    if (verbose) {
+      console.warn(`  Failed to check for existing projects: ${e?.message || e}`);
+    }
+    return null;
+  }
+}
+
+/**
  * Provision a Neon PostgreSQL database
  */
 export async function provisionNeon(
@@ -111,22 +166,60 @@ export async function provisionNeon(
     };
   }
 
-  // Resolve Neon API key and optional org id
-  const apiKey = process.env.NEON_API_KEY;
-  const orgId = process.env.NEON_ORG_ID;
+  // Get credentials from master vault or environment variables
+  const credentials = getNeonCredentials();
+  const apiKey = credentials.apiKey;
+  const orgId = credentials.orgId;
+  const region = credentials.region || 'aws-us-east-1';
 
   if (!apiKey) {
-    throw new Error('NEON_API_KEY not set. Add to .env file:\n  NEON_API_KEY=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('neon'));
   }
-
-  const region = process.env.NEON_REGION || 'aws-us-east-1';
 
   // Create project via official client
   let projectId = '';
   let databaseUrl = '';
   const api = createApiClient({ apiKey });
 
-  const attemptCreate = async () => {
+  // Check for existing project before attempting to create
+  const existingProject = await findExistingProject(api, name, verbose);
+
+  if (existingProject) {
+    // Use existing project
+    projectId = existingProject.id;
+    databaseUrl = existingProject.databaseUrl || '';
+
+    // If we couldn't get the database URL from API, try 1Password
+    if (!databaseUrl) {
+      try {
+        ensureOpAuth();
+        const vaultExists = opReadField(vaultName, 'Neon', 'Database', 'database_url');
+        if (vaultExists) {
+          databaseUrl = vaultExists;
+          if (verbose) {
+            console.log(`  Retrieved DATABASE_URL from 1Password vault: ${vaultName}`);
+          }
+        }
+      } catch (e) {
+        // Vault or field doesn't exist yet, that's ok
+        if (verbose) {
+          console.log(`  DATABASE_URL not found in 1Password, will attempt to fetch from Neon API`);
+        }
+      }
+    }
+
+    if (verbose) {
+      console.log(`  ✓ Using existing Neon project: ${name}`);
+    }
+
+    // Note: No rollback action for existing projects since we didn't create them
+  } else {
+    // Project doesn't exist, create it
+    if (verbose) {
+      console.log(`  Creating new Neon project: ${name}`);
+    }
+
+    const attemptCreate = async () => {
     const proj: any = { name, region_id: region };
     if (orgId) proj.organization_id = orgId;
     const body: any = { project: proj };
@@ -195,30 +288,11 @@ export async function provisionNeon(
 
       if (verbose) {
         console.warn(`  Retry failed: ${msg2}`);
-        console.log('  Attempting to find existing project...');
       }
 
-      // Fallback: try to find an existing project by name
-      try {
-        const list: any = await neonApiRequest(api, '/projects', 'GET');
-        const arr = (list?.projects || list?.data || list) as any[];
-        const found = Array.isArray(arr)
-          ? arr.find((p) => (p?.name || '').toLowerCase() === name.toLowerCase())
-          : null;
-
-        if (found?.id) {
-          projectId = found.id;
-          if (verbose) {
-            console.log(`  Found existing project: ${projectId}`);
-          }
-        }
-      } catch {
-        // Ignore
-      }
-
-      if (!projectId) {
-        throw new Error(`Failed to create Neon project: ${msg2}`);
-      }
+      // No fallback needed - we already checked for existing projects upfront
+      throw new Error(`Failed to create Neon project: ${msg2}`);
+    }
     }
   }
 
@@ -252,26 +326,37 @@ export async function provisionNeon(
     ensureOpAuth();
     opEnsureVault(vaultName);
 
-    const put = (title: string, field: 'username' | 'password', value: string) => {
-      if (!value) return;
-      try {
-        sh(`op item get --vault "${vaultName}" "${title}"`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "${title}" --url=local`, { verbose });
-      }
-      const esc = value.replace(/'/g, "'\\''");
-      sh(`op item edit --vault "${vaultName}" "${title}" ${field}='${esc}'`, { verbose });
-    };
-
-    put('NEON_PROJECT_ID', 'username', projectId);
-    put('DATABASE_URL', 'password', databaseUrl);
-
+    // Extract postgres host from database URL
+    let postgresHost = '';
     try {
       const u = new URL(databaseUrl);
-      put('POSTGRES_HOST', 'username', u.hostname);
+      postgresHost = u.hostname;
     } catch {
       // Ignore
     }
+
+    // Create Neon item with sections
+    const neonSections: ItemSection[] = [
+      {
+        label: 'Database',
+        fields: [
+          { label: 'project_id', value: projectId, type: 'STRING' },
+          { label: 'database_url', value: databaseUrl, type: 'CONCEALED' }
+        ]
+      }
+    ];
+
+    // Add Connection section if we have the host
+    if (postgresHost) {
+      neonSections.push({
+        label: 'Connection',
+        fields: [
+          { label: 'postgres_host', value: postgresHost, type: 'STRING' }
+        ]
+      });
+    }
+
+    opEnsureItemWithSections(vaultName, 'Neon', neonSections, undefined, verbose);
 
     if (verbose) {
       console.log(`  ✓ Wrote Neon details to 1Password vault: ${vaultName}`);
@@ -300,11 +385,12 @@ export async function listNeonInstances(
 ): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
   const { projectName, envSuffix, filterPattern, verbose } = options;
 
-  // Get API key
-  const apiKey = process.env.NEON_API_KEY;
+  // Get credentials from master vault or environment variables
+  const credentials = getNeonCredentials();
+  const apiKey = credentials.apiKey;
 
   if (!apiKey) {
-    throw new Error('NEON_API_KEY not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('neon'));
   }
 
   const api = createApiClient({ apiKey });
@@ -377,15 +463,16 @@ export async function deleteNeonInstance(
 ): Promise<{ id: string; name: string; success: boolean; error?: string }> {
   const { verbose } = options;
 
-  // Get API key
-  const apiKey = process.env.NEON_API_KEY;
+  // Get credentials from master vault or environment variables
+  const credentials = getNeonCredentials();
+  const apiKey = credentials.apiKey;
 
   if (!apiKey) {
     return {
       id: instanceId,
       name: instanceId,
       success: false,
-      error: 'NEON_API_KEY not set. Add to .env file'
+      error: getMissingCredentialsMessage('neon')
     };
   }
 

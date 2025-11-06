@@ -6,9 +6,11 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault } from './op-util.js';
+import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 import { ProvisionOptions, VercelResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getVercelCredentials, getMissingCredentialsMessage } from './credentials.js';
+import { retryFetch } from './retry-util.js';
 
 function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
   if (opts.capture) {
@@ -26,17 +28,19 @@ function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
 }
 
 function getVercelToken(): string {
-  const token = process.env.VERCEL_TOKEN;
+  const credentials = getVercelCredentials();
+  const token = credentials.token;
 
   if (!token) {
-    throw new Error('VERCEL_TOKEN not set. Add to .env file:\n  VERCEL_TOKEN=your-value\n\nOr use 1Password references with:\n  op run --env-file=".env" -- npx provision-wasp-saas ...');
+    throw new Error(getMissingCredentialsMessage('vercel') + '\nSpecifically missing: VERCEL_TOKEN');
   }
 
   return token;
 }
 
 function getVercelOrgId(): string | undefined {
-  return process.env.VERCEL_ORG_ID || process.env.VERCEL_TEAM_ID;
+  const credentials = getVercelCredentials();
+  return credentials.teamId || undefined;
 }
 
 /**
@@ -195,33 +199,40 @@ export async function provisionVercel(
       ensureOpAuth();
       opEnsureVault(vaultName);
 
-      // Create or update VERCEL item
-      try {
-        sh(`op item get --vault "${vaultName}" VERCEL`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "VERCEL" --url=local`, { verbose });
-      }
+      // Create Vercel item with sections
+      const vercelSections: ItemSection[] = [
+        {
+          label: 'Project',
+          fields: [
+            { label: 'project_id', value: projectId, type: 'STRING' },
+            { label: 'project_name', value: vercelProjectName, type: 'STRING' }
+          ]
+        },
+        {
+          label: 'Credentials',
+          fields: [
+            { label: 'token', value: token, type: 'CONCEALED' }
+          ]
+        },
+        {
+          label: 'URLs',
+          fields: [
+            { label: 'app_url', value: projectUrl, type: 'URL' }
+          ]
+        }
+      ];
 
-      const projectIdField = envSuffix === 'prod' ? 'VERCEL_PROJECT_ID_PROD' : 'VERCEL_PROJECT_ID_DEV';
-      const projectNameField = envSuffix === 'prod' ? 'VERCEL_PROJECT_NAME_PROD' : 'VERCEL_PROJECT_NAME_DEV';
-
-      sh(`op item edit --vault "${vaultName}" VERCEL ${projectIdField}=${projectId}`, { verbose });
-      sh(`op item edit --vault "${vaultName}" VERCEL ${projectNameField}=${vercelProjectName}`, { verbose });
-
+      // Add organization section if available
       if (orgId) {
-        sh(`op item edit --vault "${vaultName}" VERCEL VERCEL_ORG_ID=${orgId}`, { verbose });
+        vercelSections.splice(1, 0, {
+          label: 'Organization',
+          fields: [
+            { label: 'org_id', value: orgId, type: 'STRING' }
+          ]
+        });
       }
 
-      sh(`op item edit --vault "${vaultName}" VERCEL VERCEL_TOKEN=${token}`, { verbose });
-
-      // Store APP_URL
-      try {
-        sh(`op item get --vault "${vaultName}" APP_URL`, { verbose });
-      } catch {
-        sh(`op item create --vault "${vaultName}" --category=LOGIN --title "APP_URL" --url=local`, { verbose });
-      }
-
-      sh(`op item edit --vault "${vaultName}" APP_URL username='${projectUrl}'`, { verbose });
+      opEnsureItemWithSections(vaultName, 'Vercel', vercelSections, undefined, verbose);
 
       if (verbose) {
         console.log(`  ✓ Wrote Vercel details to 1Password vault: ${vaultName}`);
@@ -267,13 +278,16 @@ export async function listVercelInstances(
   }
 
   try {
-    const resp = await fetch('https://api.vercel.com/v9/projects', {
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-
-    if (!resp.ok) {
-      throw new Error(`Failed to list Vercel projects: HTTP ${resp.status}`);
-    }
+    const resp = await retryFetch(
+      'https://api.vercel.com/v9/projects',
+      {
+        headers: { 'Authorization': `Bearer ${token}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     const data: any = await resp.json();
     const projects = data?.projects || [];
@@ -350,20 +364,17 @@ export async function deleteVercelInstance(
   }
 
   try {
-    const resp = await fetch(`https://api.vercel.com/v9/projects/${instanceId}`, {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-
-    if (!resp.ok) {
-      const errorData: any = await resp.json().catch(() => ({}));
-      return {
-        id: instanceId,
-        name: instanceId,
-        success: false,
-        error: errorData?.error?.message || `HTTP ${resp.status}`
-      };
-    }
+    await retryFetch(
+      `https://api.vercel.com/v9/projects/${instanceId}`,
+      {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${token}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     if (verbose) {
       console.log(`    Deleted Vercel project ${instanceId}`);
