@@ -58,22 +58,26 @@ jobs:
           APP_URL: op://${{ secrets.OP_VAULT }}/Vercel/URLs/app_url
 
       - name: Validate required environment variables
-        run: node scripts/validate-env.js
+        run: node ../scripts/validate-env.js
+        working-directory: app
 
       - name: Build .env.server
-        run: node scripts/generate-env-server.js
+        run: node ../scripts/generate-env-server.js
+        working-directory: app
 
       - name: Build .env.client
-        run: node scripts/generate-env-client.js
+        run: node ../scripts/generate-env-client.js
+        working-directory: app
 
       - name: Build Wasp project
         run: wasp build
+        working-directory: app
 
       - name: Deploy backend to CapRover
         run: |
-          cd .wasp/build/server
-          tar -czf ../../../backend-deploy.tar.gz .
-          cd ../../..
+          cd app/.wasp/build/server
+          tar -czf ../../../../backend-deploy.tar.gz .
+          cd ../../../..
           npx --yes caprover@latest deploy \
             --caproverUrl "$CAPROVER_URL" \
             --appToken "$CAPROVER_APP_TOKEN" \
@@ -81,13 +85,14 @@ jobs:
             --tarFile ./backend-deploy.tar.gz
 
       - name: Deploy frontend to Vercel
-        working-directory: .wasp/build/web-app
+        working-directory: app/.wasp/build/web-app
         run: npx vercel deploy --prod --token "$VERCEL_TOKEN" --yes
         env:
           VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
 
       - name: Run database migrations
+        working-directory: app
         run: |
           export DATABASE_URL="${DATABASE_URL}"
           wasp db migrate-deploy
