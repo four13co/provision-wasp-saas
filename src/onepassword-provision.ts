@@ -67,8 +67,65 @@ export async function provisionOnePassword(
 
     opEnsureItemWithSections(vaultName, 'Auth', authSections, undefined, verbose);
 
+    // Create placeholder items for optional services
+    // These prevent GitHub Actions workflow from failing when loading secrets
+    // Actual provisioners will update these with real values when services are configured
+    const optionalServices: Array<{ itemName: string; sections: ItemSection[] }> = [
+      {
+        itemName: 'Stripe',
+        sections: [
+          { label: 'Credentials', fields: [
+            { label: 'api_key', value: 'PLACEHOLDER_STRIPE_NOT_CONFIGURED', type: 'CONCEALED' as const },
+            { label: 'webhook_secret', value: 'PLACEHOLDER_STRIPE_NOT_CONFIGURED', type: 'CONCEALED' as const }
+          ]},
+          { label: 'Customer Portal', fields: [
+            { label: 'customer_portal_url', value: '', type: 'STRING' as const }
+          ]},
+          { label: 'Plans', fields: [
+            { label: 'hobby_plan_id', value: '', type: 'STRING' as const },
+            { label: 'pro_plan_id', value: '', type: 'STRING' as const }
+          ]}
+        ]
+      },
+      {
+        itemName: 'Sendgrid',
+        sections: [
+          { label: 'Credentials', fields: [
+            { label: 'api_key', value: 'PLACEHOLDER_SENDGRID_NOT_CONFIGURED', type: 'CONCEALED' as const }
+          ]}
+        ]
+      },
+      {
+        itemName: 'AWS',
+        sections: [
+          { label: 'Credentials', fields: [
+            { label: 'access_key', value: 'PLACEHOLDER_AWS_NOT_CONFIGURED', type: 'CONCEALED' as const },
+            { label: 'secret_key', value: 'PLACEHOLDER_AWS_NOT_CONFIGURED', type: 'CONCEALED' as const }
+          ]},
+          { label: 'Configuration', fields: [
+            { label: 'files_bucket', value: '', type: 'STRING' as const },
+            { label: 'region', value: 'us-east-1', type: 'STRING' as const }
+          ]}
+        ]
+      },
+      {
+        itemName: 'Google',
+        sections: [
+          { label: 'OAuth', fields: [
+            { label: 'client_id', value: 'PLACEHOLDER_GOOGLE_NOT_CONFIGURED', type: 'STRING' as const },
+            { label: 'client_secret', value: 'PLACEHOLDER_GOOGLE_NOT_CONFIGURED', type: 'CONCEALED' as const }
+          ]}
+        ]
+      }
+    ];
+
+    for (const service of optionalServices) {
+      opEnsureItemWithSections(vaultName, service.itemName, service.sections, undefined, verbose);
+    }
+
     if (verbose) {
       console.log(`  ✓ Created Auth item with JWT secret`);
+      console.log(`  ✓ Created placeholder items for optional services`);
       console.log(`  ✓ 1Password vault provisioned: ${vaultName}`);
     } else {
       console.log(`  ✓ 1Password: ${vaultName}`);

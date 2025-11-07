@@ -49,7 +49,8 @@ function generateEnvServer() {
 
   for (const key of SERVER_ENV_KEYS) {
     const value = process.env[key];
-    if (value && value.trim() !== '') {
+    // Skip if empty or placeholder value
+    if (value && value.trim() !== '' && !value.startsWith('PLACEHOLDER_')) {
       envLines.push(`${key}=${value}`);
       foundCount++;
     } else {

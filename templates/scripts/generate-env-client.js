@@ -22,7 +22,8 @@ function generateEnvClient() {
 
   for (const { from, to } of mappings) {
     const value = process.env[from];
-    if (value && value.trim() !== '') {
+    // Skip if empty or placeholder value
+    if (value && value.trim() !== '' && !value.startsWith('PLACEHOLDER_')) {
       envLines.push(`${to}=${value}`);
       foundCount++;
     }
@@ -30,7 +31,8 @@ function generateEnvClient() {
 
   // Also include any existing REACT_APP_* variables
   for (const [key, value] of Object.entries(process.env)) {
-    if (key.startsWith('REACT_APP_') && value && value.trim() !== '') {
+    // Skip if empty or placeholder value
+    if (key.startsWith('REACT_APP_') && value && value.trim() !== '' && !value.startsWith('PLACEHOLDER_')) {
       // Don't duplicate if we already added it from mappings
       if (!envLines.some(line => line.startsWith(`${key}=`))) {
         envLines.push(`${key}=${value}`);
