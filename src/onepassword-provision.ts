@@ -79,11 +79,11 @@ export async function provisionOnePassword(
             { label: 'webhook_secret', value: 'PLACEHOLDER_STRIPE_NOT_CONFIGURED', type: 'CONCEALED' as const }
           ]},
           { label: 'Customer Portal', fields: [
-            { label: 'customer_portal_url', value: '', type: 'STRING' as const }
+            { label: 'customer_portal_url', value: 'PLACEHOLDER_NOT_CONFIGURED', type: 'STRING' as const }
           ]},
           { label: 'Plans', fields: [
-            { label: 'hobby_plan_id', value: '', type: 'STRING' as const },
-            { label: 'pro_plan_id', value: '', type: 'STRING' as const }
+            { label: 'hobby_plan_id', value: 'PLACEHOLDER_NOT_CONFIGURED', type: 'STRING' as const },
+            { label: 'pro_plan_id', value: 'PLACEHOLDER_NOT_CONFIGURED', type: 'STRING' as const }
           ]}
         ]
       },
@@ -103,8 +103,8 @@ export async function provisionOnePassword(
             { label: 'secret_key', value: 'PLACEHOLDER_AWS_NOT_CONFIGURED', type: 'CONCEALED' as const }
           ]},
           { label: 'Configuration', fields: [
-            { label: 'files_bucket', value: '', type: 'STRING' as const },
-            { label: 'region', value: 'us-east-1', type: 'STRING' as const }
+            { label: 'files_bucket', value: 'PLACEHOLDER_NOT_CONFIGURED', type: 'STRING' as const },
+            { label: 'region', value: 'PLACEHOLDER_NOT_CONFIGURED', type: 'STRING' as const }
           ]}
         ]
       },
