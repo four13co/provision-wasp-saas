@@ -59,6 +59,7 @@ interface CliArgs {
   verbose: boolean;
   help: boolean;
   dryRun: boolean;
+  force: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -118,7 +119,8 @@ function parseArgs(): CliArgs {
     env,
     verbose: args.includes('--verbose') || args.includes('-v'),
     help: args.includes('--help') || args.includes('-h'),
-    dryRun: args.includes('--dry-run')
+    dryRun: args.includes('--dry-run'),
+    force: args.includes('--force')
   };
 }
 
@@ -171,6 +173,7 @@ GENERAL OPTIONS:
   --env <dev|prod|all>           Environment selection (default: all)
   --verbose, -v                  Show detailed output
   --dry-run                      Show what would be done without making changes
+  --force                        Force reprovisioning even if resources already exist
   --check-config                 Check credential configuration and show status
   --help, -h                     Show this help message
 
@@ -565,7 +568,8 @@ async function main() {
         includeEnv,
         environments,
         verbose: args.verbose,
-        dryRun: args.dryRun
+        dryRun: args.dryRun,
+        force: args.force
       });
     }
   } catch (error) {

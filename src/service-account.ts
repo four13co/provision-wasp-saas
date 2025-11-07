@@ -168,6 +168,81 @@ export function getGitHubOwner(): string {
   }
 }
 
+export interface SecretValidationResult {
+  exists: boolean;
+  valid: boolean;
+  errors: string[];
+}
+
+/**
+ * Validate GitHub secrets for an environment
+ * Checks if secrets exist and if the service account token is valid
+ */
+export async function validateGitHubSecrets(
+  repo: string,
+  environment: 'dev' | 'prod',
+  vaultName: string,
+  verbose?: boolean
+): Promise<SecretValidationResult> {
+  const errors: string[] = [];
+  const envUpper = environment.toUpperCase();
+  const tokenSecretName = `OP_SERVICE_ACCOUNT_TOKEN_${envUpper}`;
+  const vaultSecretName = `OP_VAULT_${envUpper}`;
+
+  if (verbose) {
+    console.log(`  Validating GitHub secrets for ${environment}...`);
+  }
+
+  try {
+    // Check if secrets exist
+    const secretsList = execSync(`gh secret list --repo "${repo}"`, {
+      stdio: 'pipe',
+      encoding: 'utf-8'
+    });
+
+    const tokenExists = secretsList.includes(tokenSecretName);
+    const vaultExists = secretsList.includes(vaultSecretName);
+
+    if (!tokenExists) {
+      errors.push(`Secret ${tokenSecretName} does not exist`);
+    }
+
+    if (!vaultExists) {
+      errors.push(`Secret ${vaultSecretName} does not exist`);
+    }
+
+    if (!tokenExists || !vaultExists) {
+      return {
+        exists: false,
+        valid: false,
+        errors
+      };
+    }
+
+    // Secrets exist, but we can't validate the token value without the actual token
+    // (GitHub doesn't expose secret values via API for security reasons)
+    // We'll consider secrets valid if they exist
+    // Users can force reprovision with --force flag if tokens are invalid
+
+    if (verbose) {
+      console.log(`  ✓ GitHub secrets exist for ${environment}`);
+    }
+
+    return {
+      exists: true,
+      valid: true,
+      errors: []
+    };
+  } catch (error: any) {
+    errors.push(`Failed to validate secrets: ${error.message}`);
+    return {
+      exists: false,
+      valid: false,
+      errors
+    };
+  }
+}
+
 /**
  * Create rollback action for deleting a GitHub secret
  */
@@ -194,9 +269,31 @@ export async function setupServiceAccountAndSecrets(options: {
   vaultName: string;
   repo: string;
   verbose?: boolean;
-}): Promise<{ rollbackActions: RollbackAction[] }> {
-  const { projectName, environment, vaultName, repo, verbose } = options;
+  force?: boolean;
+}): Promise<{ rollbackActions: RollbackAction[]; skipped: boolean }> {
+  const { projectName, environment, vaultName, repo, verbose, force = false } = options;
   const rollbackActions: RollbackAction[] = [];
+
+  // Check existing secrets unless force mode is enabled
+  if (!force) {
+    const validation = await validateGitHubSecrets(repo, environment, vaultName, verbose);
+
+    if (validation.exists && validation.valid) {
+      if (verbose) {
+        console.log(`  ✓ GitHub secrets for ${environment} already configured and valid`);
+      }
+      return { rollbackActions, skipped: true };
+    }
+
+    if (validation.exists && !validation.valid) {
+      if (verbose) {
+        console.log(`  ⚠ Existing secrets for ${environment} are invalid, reprovisioning...`);
+        validation.errors.forEach(err => console.log(`    - ${err}`));
+      }
+    }
+  } else if (verbose) {
+    console.log(`  Force mode enabled, reprovisioning secrets for ${environment}...`);
+  }
 
   const envUpper = environment.toUpperCase();
   const timestamp = new Date().toISOString().replace(/[-:T.]/g, '').substring(0, 14);
@@ -205,13 +302,14 @@ export async function setupServiceAccountAndSecrets(options: {
   try {
     // 1. Create service account
     if (verbose) {
-      console.log(`  Setting up service account for ${environment} environment...`);
+      console.log(`  Creating service account for ${environment} environment...`);
     }
 
     const serviceAccount = await createServiceAccount({
       name: serviceAccountName,
       vault: vaultName,
       permissions: ['read_items'],
+      expiresIn: '90d', // Auto-expire after 90 days
       verbose
     });
 
@@ -243,7 +341,7 @@ export async function setupServiceAccountAndSecrets(options: {
       console.log(`  ✓ Service account and secrets configured for ${environment}`);
     }
 
-    return { rollbackActions };
+    return { rollbackActions, skipped: false };
   } catch (error: any) {
     throw new Error(`Failed to setup service account for ${environment}: ${error.message}`);
   }

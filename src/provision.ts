@@ -27,6 +27,7 @@ export interface ProvisionOptions {
   // Flags
   verbose?: boolean;
   dryRun?: boolean;
+  force?: boolean; // Force reprovisioning even if resources exist
 
   // Auto-detected
   projectName?: string;
@@ -45,6 +46,7 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
     environments = ['dev', 'prod'],
     verbose = false,
     dryRun = false,
+    force = false,
     projectName: customProjectName,
     projectDir = process.cwd()
   } = options;
@@ -169,7 +171,12 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
         try {
           await createGitHubRepo({ projectName, verbose });
 
-          const { rollbackActions: githubRollback } = await setupGitHubSecrets({ projectName, environments, verbose });
+          const { rollbackActions: githubRollback } = await setupGitHubSecrets({
+            projectName,
+            environments,
+            verbose,
+            force
+          });
           rollbackActions.push(...githubRollback);
 
           await copyWorkflowTemplates({ projectName, verbose });

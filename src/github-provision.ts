@@ -22,6 +22,7 @@ export interface GitHubSecretsOptions {
   projectName: string;
   environments: Array<'dev' | 'prod'>;
   verbose?: boolean;
+  force?: boolean;
 }
 
 export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void> {
@@ -77,7 +78,7 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
 }
 
 export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
-  const { projectName, environments, verbose } = options;
+  const { projectName, environments, verbose, force = false } = options;
   const rollbackActions: RollbackAction[] = [];
 
   // Get GitHub owner and construct repo full name
@@ -86,34 +87,56 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
 
   if (verbose) {
     console.log(`  Setting up GitHub secrets for ${repo}...`);
+    if (force) {
+      console.log(`  Force mode enabled - will reprovision all secrets`);
+    }
   }
+
+  let createdCount = 0;
+  let skippedCount = 0;
 
   // Create service account and GitHub secrets for each environment
   for (const env of environments) {
     const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
 
-    if (verbose) {
-      console.log(`  Creating service account for ${env}...`);
-    }
-
     try {
-      const { rollbackActions: envRollback } = await setupServiceAccountAndSecrets({
+      const { rollbackActions: envRollback, skipped } = await setupServiceAccountAndSecrets({
         projectName,
         environment: env,
         vaultName,
         repo,
-        verbose
+        verbose,
+        force
       });
 
       rollbackActions.push(...envRollback);
+
+      if (skipped) {
+        skippedCount++;
+      } else {
+        createdCount++;
+      }
     } catch (error: any) {
       throw new Error(`Failed to setup service account for ${env}: ${error.message}`);
     }
   }
 
   if (verbose) {
-    console.log(`  ✓ Service accounts created (${environments.length})`);
+    if (createdCount > 0) {
+      console.log(`  ✓ Service accounts created/updated: ${createdCount}`);
+    }
+    if (skippedCount > 0) {
+      console.log(`  ✓ Environments skipped (already configured): ${skippedCount}`);
+    }
     console.log('  ✓ GitHub secrets configured');
+  } else if (createdCount > 0 || skippedCount > 0) {
+    if (createdCount > 0 && skippedCount > 0) {
+      console.log(`  ✓ GitHub secrets: ${createdCount} updated, ${skippedCount} skipped`);
+    } else if (createdCount > 0) {
+      console.log(`  ✓ GitHub secrets: ${createdCount} environment(s) configured`);
+    } else {
+      console.log(`  ✓ GitHub secrets: all environments already configured`);
+    }
   }
 
   return { rollbackActions };
