@@ -71,8 +71,13 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
     // Remote might already exist
   }
 
-  // Create Production branch reference
-  execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
+  // Create Production branch reference (if it doesn't exist)
+  try {
+    execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
+  } catch {
+    // Production branch might already exist
+    if (verbose) console.log('  Production branch already exists');
+  }
 
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
