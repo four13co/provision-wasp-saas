@@ -251,6 +251,41 @@ export async function copyScriptTemplates(options: { projectName: string; verbos
 }
 
 /**
+ * Copy CapRover configuration file to user's project
+ */
+export async function copyCapRoverConfig(options: { verbose?: boolean }): Promise<void> {
+  const { verbose } = options;
+
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Get template file path
+  const templatePath = path.join(__dirname, '../templates/captain-definition');
+
+  if (!fs.existsSync(templatePath)) {
+    throw new Error(`CapRover config template not found: ${templatePath}`);
+  }
+
+  // Copy to git root
+  const targetPath = path.join(gitRoot, 'captain-definition');
+  const content = fs.readFileSync(templatePath, 'utf-8');
+  fs.writeFileSync(targetPath, content);
+
+  if (verbose) {
+    console.log(`  ✓ Copied captain-definition to project root`);
+  } else {
+    console.log(`  ✓ Copied CapRover configuration`);
+  }
+}
+
+/**
  * List all GitHub repositories for cleanup
  */
 export async function listGitHubInstances(

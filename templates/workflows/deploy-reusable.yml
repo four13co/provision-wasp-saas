@@ -73,6 +73,41 @@ jobs:
         run: wasp build
         working-directory: app
 
+      - name: Build frontend static files
+        run: npm run build
+        working-directory: app/.wasp/build/web-app
+
+      - name: Prepare Vercel Build Output API structure
+        run: |
+          # Create Build Output API v3 directory structure
+          mkdir -p .vercel/output/static
+
+          # Copy pre-built static files
+          cp -r app/.wasp/build/web-app/build/* .vercel/output/static/
+
+          # Create config.json for SPA routing
+          cat > .vercel/output/config.json << 'EOF'
+          {
+            "version": 3,
+            "routes": [
+              {
+                "src": "/assets/(.*)",
+                "dest": "/assets/$1"
+              },
+              {
+                "handle": "filesystem"
+              },
+              {
+                "src": "/(.*)",
+                "dest": "/index.html"
+              }
+            ]
+          }
+          EOF
+
+      - name: Copy captain-definition to server build
+        run: cp templates/captain-definition app/.wasp/build/server/
+
       - name: Deploy backend to CapRover
         run: |
           cd app/.wasp/build/server
@@ -85,8 +120,7 @@ jobs:
             --tarFile ./backend-deploy.tar.gz
 
       - name: Deploy frontend to Vercel
-        working-directory: app/.wasp/build/web-app
-        run: npx vercel deploy --prod --token "$VERCEL_TOKEN" --yes
+        run: npx vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN" --yes
         env:
           VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
