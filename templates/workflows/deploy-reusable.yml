@@ -1,0 +1,132 @@
+name: Reusable Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'Environment name (dev or prod)'
+      app_name_suffix:
+        required: true
+        type: string
+        description: 'App name suffix (e.g., -dev or -prod)'
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: true
+      OP_VAULT:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Wasp
+        run: curl -sSL https://get.wasp-lang.dev/installer.sh | sh
+
+      - name: Load secrets from 1Password
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          DATABASE_URL: op://${{ secrets.OP_VAULT }}/Neon/Database/database_url
+          JWT_SECRET: op://${{ secrets.OP_VAULT }}/Auth/Secrets/jwt_secret
+          STRIPE_API_KEY: op://${{ secrets.OP_VAULT }}/Stripe/Credentials/api_key
+          STRIPE_WEBHOOK_SECRET: op://${{ secrets.OP_VAULT }}/Stripe/Credentials/webhook_secret
+          SENDGRID_API_KEY: op://${{ secrets.OP_VAULT }}/Sendgrid/Credentials/api_key
+          RESEND_API_KEY: op://${{ secrets.OP_VAULT }}/Resend/Credentials/api_key
+          AWS_S3_IAM_ACCESS_KEY: op://${{ secrets.OP_VAULT }}/AWS/Credentials/access_key
+          AWS_S3_IAM_SECRET_KEY: op://${{ secrets.OP_VAULT }}/AWS/Credentials/secret_key
+          AWS_S3_FILES_BUCKET: op://${{ secrets.OP_VAULT }}/AWS/Configuration/files_bucket
+          GOOGLE_CLIENT_ID: op://${{ secrets.OP_VAULT }}/Google/OAuth/client_id
+          GOOGLE_CLIENT_SECRET: op://${{ secrets.OP_VAULT }}/Google/OAuth/client_secret
+          CAPROVER_URL: op://${{ secrets.OP_VAULT }}/CapRover/Server/url
+          CAPROVER_APP_TOKEN: op://${{ secrets.OP_VAULT }}/CapRover/Deployment/app_token
+          VERCEL_TOKEN: op://${{ secrets.OP_VAULT }}/Vercel/Credentials/token
+          VERCEL_PROJECT_ID: op://${{ secrets.OP_VAULT }}/Vercel/Project/project_id
+          VERCEL_ORG_ID: op://${{ secrets.OP_VAULT }}/Vercel/Organization/org_id
+          API_URL: op://${{ secrets.OP_VAULT }}/CapRover/URLs/api_url
+          APP_URL: op://${{ secrets.OP_VAULT }}/Vercel/URLs/app_url
+
+      - name: Validate required environment variables
+        run: node ../scripts/validate-env.js
+        working-directory: app
+
+      - name: Build .env.server
+        run: node ../scripts/generate-env-server.js
+        working-directory: app
+
+      - name: Build .env.client
+        run: node ../scripts/generate-env-client.js
+        working-directory: app
+
+      - name: Build Wasp project
+        run: wasp build
+        working-directory: app
+
+      - name: Build frontend static files
+        run: npm run build
+        working-directory: app/.wasp/build/web-app
+
+      - name: Prepare Vercel Build Output API structure
+        run: |
+          # Create Build Output API v3 directory structure
+          mkdir -p .vercel/output/static
+
+          # Copy pre-built static files
+          cp -r app/.wasp/build/web-app/build/* .vercel/output/static/
+
+          # Create config.json for SPA routing
+          cat > .vercel/output/config.json << 'EOF'
+          {
+            "version": 3,
+            "routes": [
+              {
+                "src": "/assets/(.*)",
+                "dest": "/assets/$1"
+              },
+              {
+                "handle": "filesystem"
+              },
+              {
+                "src": "/(.*)",
+                "dest": "/index.html"
+              }
+            ]
+          }
+          EOF
+
+      - name: Copy captain-definition to server build
+        run: cp templates/captain-definition app/.wasp/build/server/
+
+      - name: Deploy backend to CapRover
+        run: |
+          cd app/.wasp/build/server
+          tar -czf ../../../../backend-deploy.tar.gz .
+          cd ../../../..
+          npx --yes caprover@latest deploy \
+            --caproverUrl "$CAPROVER_URL" \
+            --appToken "$CAPROVER_APP_TOKEN" \
+            --appName "{{PROJECT_NAME}}-api${{ inputs.app_name_suffix }}" \
+            --tarFile ./backend-deploy.tar.gz
+
+      - name: Deploy frontend to Vercel
+        run: npx vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN" --yes
+        env:
+          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
+
+      - name: Run database migrations
+        working-directory: app
+        run: |
+          export DATABASE_URL="${DATABASE_URL}"
+          wasp db migrate-deploy

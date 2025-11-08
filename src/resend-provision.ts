@@ -1,155 +1,317 @@
-import { execSync } from 'node:child_process';
-import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault } from './op-util.js';
+/**
+ * Resend provisioning (email service)
+ * - Creates a Resend API key
+ * - Writes key to 1Password vault
+ */
 
-const VERBOSE = process.env.TZ_VERBOSE === '1' || process.argv.includes('--verbose');
-function sh(cmd: string, opts: { capture?: boolean } = {}) {
-  if (opts.capture) return execSync(cmd, { stdio: 'pipe' }).toString();
-  if (VERBOSE) {
+import { execSync } from 'node:child_process';
+import { ensureOpAuth, opGetItem, opItemField, opReadRef, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
+import { ProvisionOptions, ResendResult } from './types.js';
+import { createRollbackAction, RollbackAction } from './rollback.js';
+import { getResendCredentials, getMissingCredentialsMessage } from './credentials.js';
+import { retryFetch } from './retry-util.js';
+
+function sh(cmd: string, opts: { capture?: boolean; verbose?: boolean } = {}) {
+  if (opts.capture) {
+    return execSync(cmd, { stdio: 'pipe' }).toString();
+  }
+
+  if (opts.verbose) {
     console.log(`$ ${cmd}`);
     execSync(cmd, { stdio: 'inherit' });
   } else {
     execSync(cmd, { stdio: 'ignore' });
   }
+
   return '';
 }
 
 function getResendMasterKey(): string {
-  const direct = process.env.RESEND_API_KEY || process.env.RESEND_MASTER_KEY;
-  if (direct) {
-    if (/^op:\/\//i.test(direct)) {
-      ensureOpAuth();
-      const v = opReadRef(direct);
-      if (v) return v;
-    }
-    return direct;
+  const credentials = getResendCredentials();
+  const key = credentials.apiKey;
+
+  if (!key) {
+    throw new Error(getMissingCredentialsMessage('resend') + '\nSpecifically missing: RESEND_API_KEY');
   }
-  ensureOpAuth();
-  const vault = process.env.OP_VAULT_MASTER || 'tz-saas-master';
-  const item = opGetItem(vault, 'RESEND');
-  let key = opItemField(item, 'credential') || opItemField(item, 'API_KEY') || opItemField(item, 'RESEND_API_KEY');
-  if (!key && item?.fields) {
-    const f = item.fields.find((x) => (x.label || '').toLowerCase().includes('key') || (x.label || '').toLowerCase().includes('credential'));
-    key = (f?.value as string) || null;
-  }
-  if (!key) throw new Error('Missing env: RESEND_API_KEY (and not found in 1Password RESEND item at op://tz-saas-master/RESEND/credential)');
+
   return key;
 }
 
-async function createApiKey(masterKey: string, keyName: string): Promise<{ id: string; token: string } | null> {
-  try {
-    const response = await fetch('https://api.resend.com/api-keys', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${masterKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        name: keyName,
-        permission: 'sending_access'
-      })
-    });
+/**
+ * Provision a Resend API key
+ */
+export async function provisionResend(
+  options: ProvisionOptions
+): Promise<{ result: ResendResult; rollbackActions: RollbackAction[] }> {
+  const { projectName, envSuffix, verbose, dryRun } = options;
+  const rollbackActions: RollbackAction[] = [];
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Resend API error (${response.status}): ${errorText}`);
-    }
+  const keyName = `${projectName}-${envSuffix}`;
+  const vaultName = `${projectName}-${envSuffix}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+  if (verbose) {
+    console.log(`  Resend API key name: ${keyName}`);
+  }
+
+  if (dryRun) {
+    console.log(`  [DRY RUN] Would create Resend API key: ${keyName}`);
+    return {
+      result: {
+        key: {
+          id: 'dry-run-key-id',
+          token: 're_dry_run_token',
+          name: keyName
+        }
+      },
+      rollbackActions
+    };
+  }
+
+  const masterKey = getResendMasterKey();
+
+  try {
+    // Create API key via Resend API with retry logic
+    const response = await retryFetch(
+      'https://api.resend.com/api-keys',
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${masterKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          name: keyName,
+          permission: 'sending_access'
+        })
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
 
     const data = await response.json() as { id: string; token: string };
-    return data;
-  } catch (e) {
-    console.error(`Failed to create Resend API key "${keyName}":`, (e as Error).message);
-    return null;
-  }
-}
 
-function saveToVault(
-  vault: string | undefined | null,
-  baseName: string,
-  devKey: { id: string; token: string } | null | undefined,
-  prodKey: { id: string; token: string } | null | undefined,
-  envSuffix: 'dev' | 'prod'
-) {
-  if (!vault) return;
-  try {
-    // Ensure RESEND item exists in project vault
-    try { sh(`op item get --vault "${vault}" RESEND`); }
-    catch (e) { sh(`op item create --vault "${vault}" --category=LOGIN --title "RESEND" --url=local`); }
-
-    // Store keys
-    if (devKey) {
-      sh(`op item edit --vault "${vault}" RESEND RESEND_API_KEY_DEV_ID=${devKey.id}`);
-      sh(`op item edit --vault "${vault}" RESEND RESEND_API_KEY_DEV="${devKey.token}"`);
-    }
-    if (prodKey) {
-      sh(`op item edit --vault "${vault}" RESEND RESEND_API_KEY_PROD_ID=${prodKey.id}`);
-      sh(`op item edit --vault "${vault}" RESEND RESEND_API_KEY_PROD="${prodKey.token}"`);
+    if (verbose) {
+      console.log(`  ✓ Created Resend API key: ${keyName} (${data.id})`);
     }
 
-    // Store active key for current environment
-    const activeKey = envSuffix === 'prod' ? prodKey : devKey;
-    if (activeKey) {
-      sh(`op item edit --vault "${vault}" RESEND RESEND_API_KEY="${activeKey.token}"`);
-      if (VERBOSE) {
-        console.log(`✓ Stored RESEND_API_KEY in vault ${vault} for ${envSuffix} environment`);
-      }
-    }
+    // Add rollback action to delete the key
+    rollbackActions.push(
+      createRollbackAction(
+        'resend',
+        `Delete Resend API key ${keyName} (${data.id})`,
+        async () => {
+          try {
+            await retryFetch(
+              `https://api.resend.com/api-keys/${data.id}`,
+              {
+                method: 'DELETE',
+                headers: {
+                  'Authorization': `Bearer ${masterKey}`
+                }
+              },
+              {
+                maxRetries: 2,
+                verbose: false
+              }
+            );
 
-    // Store EMAIL_FROM for current environment
-    const emailFrom = envSuffix === 'prod'
-      ? `no-reply@${baseName}.com`
-      : `no-reply@dev.${baseName}.com`;
-    sh(`op item edit --vault "${vault}" RESEND EMAIL_FROM="${emailFrom}"`);
-    if (VERBOSE) {
-      console.log(`✓ Stored EMAIL_FROM in vault ${vault}: ${emailFrom}`);
-    }
-  } catch (e) {
-    console.warn('Could not write Resend keys to 1Password:', (e as Error).message);
-  }
-}
+            if (verbose) {
+              console.log(`    Deleted Resend API key ${data.id}`);
+            }
+          } catch (e: any) {
+            console.warn(`    Failed to delete Resend API key: ${e?.message || e}`);
+          }
+        }
+      )
+    );
 
-async function main() {
-  const masterKey = getResendMasterKey();
-  const baseName = process.env.PROJECT_NAME || 'tz-saas-project';
-  const envSuffix = process.env.ENV_SUFFIX || 'dev';
-  const vault = `${baseName}-${envSuffix}`;
-
-  try {
-    console.log('[resend] Creating project-specific API keys...');
-
-    const devKey = await createApiKey(masterKey, `${baseName}-dev`);
-    if (devKey) {
-      console.log(`✓ Created Resend API key: ${baseName}-dev (${devKey.id})`);
-    }
-
-    const prodKey = await createApiKey(masterKey, `${baseName}-prod`);
-    if (prodKey) {
-      console.log(`✓ Created Resend API key: ${baseName}-prod (${prodKey.id})`);
-    }
-
-    if (!devKey && !prodKey) {
-      throw new Error('Failed to create any Resend API keys');
-    }
-
-    if (vault) {
+    // Write to 1Password project vault
+    try {
       ensureOpAuth();
-      opEnsureVault(vault);
+      opEnsureVault(vaultName);
+
+      // Compute email from address
+      const emailFrom = envSuffix === 'prod'
+        ? `no-reply@${projectName}.com`
+        : `no-reply@dev.${projectName}.com`;
+
+      // Create Resend item with sections
+      const resendSections: ItemSection[] = [
+        {
+          label: 'Credentials',
+          fields: [
+            { label: 'api_key_id', value: data.id, type: 'STRING' },
+            { label: 'api_key', value: data.token, type: 'CONCEALED' }
+          ]
+        },
+        {
+          label: 'Configuration',
+          fields: [
+            { label: 'email_from', value: emailFrom, type: 'EMAIL' }
+          ]
+        }
+      ];
+
+      opEnsureItemWithSections(vaultName, 'Resend', resendSections, undefined, verbose);
+
+      if (verbose) {
+        console.log(`  ✓ Wrote Resend details to 1Password vault: ${vaultName}`);
+      }
+    } catch (e: any) {
+      console.warn(`  Warning: Failed to write to 1Password: ${e?.message || e}`);
     }
 
-    const envKey = (envSuffix === 'prod' ? 'prod' : 'dev') as 'dev' | 'prod';
-    saveToVault(vault, baseName, devKey, prodKey, envKey);
-
-    if (VERBOSE) {
-      console.log(JSON.stringify({
-        dev: devKey ? { id: devKey.id, token: '***' } : null,
-        prod: prodKey ? { id: prodKey.id, token: '***' } : null
-      }, null, 2));
+    if (verbose) {
+      console.log(`  ✓ Resend API key provisioned: ${keyName}`);
     } else {
-      console.log(`[resend] Created API keys: ${devKey ? `${baseName}-dev` : 'dev?'} ${prodKey ? `and ${baseName}-prod` : ''}`.trim());
+      console.log(`  ✓ Resend: ${keyName}`);
     }
-  } catch (e) {
-    console.error('Resend provision failed:', (e as Error).message);
-    process.exit(1);
+
+    return {
+      result: {
+        key: {
+          id: data.id,
+          token: data.token,
+          name: keyName
+        }
+      },
+      rollbackActions
+    };
+  } catch (e: any) {
+    throw new Error(`Resend provisioning failed: ${e?.message || e}`);
   }
 }
 
-main();
+/**
+ * List all Resend API keys for cleanup
+ */
+export async function listResendInstances(
+  options: { projectName?: string; envSuffix?: 'dev' | 'prod'; filterPattern?: string; verbose?: boolean }
+): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
+  const { projectName, envSuffix, filterPattern, verbose } = options;
+
+  // Get Resend API key
+  const apiKey = process.env.RESEND_API_KEY;
+
+  if (!apiKey) {
+    throw new Error('RESEND_API_KEY not set. Add to .env file');
+  }
+
+  try {
+    const resp = await retryFetch(
+      'https://api.resend.com/api-keys',
+      {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
+
+    const data: any = await resp.json();
+    const keys = data?.data || [];
+
+    // Filter resources
+    let matches = keys;
+
+    if (filterPattern) {
+      // Use custom filter pattern
+      const pattern = filterPattern.toLowerCase();
+      matches = matches.filter((key: any) => {
+        const name = (key?.name || '').toLowerCase();
+        return name.includes(pattern);
+      });
+    } else if (projectName) {
+      // Filter by project name pattern
+      const pattern = envSuffix
+        ? `${projectName}-${envSuffix}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-')
+        : `${projectName}-`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+      matches = matches.filter((key: any) => {
+        const name = (key?.name || '').toLowerCase();
+        return envSuffix
+          ? name === pattern
+          : name.startsWith(pattern);
+      });
+    }
+    // If neither filterPattern nor projectName: return all resources
+
+    return matches.map((key: any) => {
+      const name = key.name || key.id;
+      const env = name.endsWith('-dev') ? 'dev' as const
+        : name.endsWith('-prod') ? 'prod' as const
+        : 'unknown' as const;
+
+      return {
+        id: key.id,
+        name: key.name,
+        environment: env,
+        metadata: {
+          permission: key.permission
+        },
+        createdAt: key.created_at
+      };
+    });
+  } catch (error: any) {
+    if (verbose) {
+      console.warn(`  Warning: Failed to list Resend API keys: ${error?.message || error}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Delete a Resend API key by ID
+ */
+export async function deleteResendInstance(
+  instanceId: string,
+  options: { verbose?: boolean }
+): Promise<{ id: string; name: string; success: boolean; error?: string }> {
+  const { verbose } = options;
+
+  // Get Resend API key
+  const apiKey = process.env.RESEND_API_KEY;
+
+  if (!apiKey) {
+    return {
+      id: instanceId,
+      name: instanceId,
+      success: false,
+      error: 'RESEND_API_KEY not set. Add to .env file'
+    };
+  }
+
+  try {
+    await retryFetch(
+      `https://api.resend.com/api-keys/${instanceId}`,
+      {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      },
+      {
+        maxRetries: 3,
+        verbose: verbose
+      }
+    );
+
+    if (verbose) {
+      console.log(`    Deleted Resend API key ${instanceId}`);
+    }
+
+    return {
+      id: instanceId,
+      name: instanceId,
+      success: true
+    };
+  } catch (error: any) {
+    return {
+      id: instanceId,
+      name: instanceId,
+      success: false,
+      error: error?.message || String(error)
+    };
+  }
+}

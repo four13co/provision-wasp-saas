@@ -5,6 +5,13 @@
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setupServiceAccountAndSecrets, getGitHubOwner } from './service-account.js';
+import { RollbackAction } from './rollback.js';
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export interface GitHubRepoOptions {
   projectName: string;
@@ -13,9 +20,9 @@ export interface GitHubRepoOptions {
 
 export interface GitHubSecretsOptions {
   projectName: string;
-  vaultDev: string;
-  vaultProd: string;
+  environments: Array<'dev' | 'prod'>;
   verbose?: boolean;
+  force?: boolean;
 }
 
 export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void> {
@@ -38,57 +45,123 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
 
   if (verbose) console.log(`  Created repository: ${projectName}`);
 
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
   // Initialize git if not already initialized
-  if (!fs.existsSync('.git')) {
-    execSync('git init', { stdio: verbose ? 'inherit' : 'ignore' });
-    execSync('git branch -M Development', { stdio: verbose ? 'inherit' : 'ignore' });
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    execSync('git init', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
+    execSync('git branch -M Development', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
   }
 
   // Add remote
   try {
     execSync(`git remote add origin https://github.com/$(gh api user -q .login)/${projectName}.git`, {
-      stdio: verbose ? 'inherit' : 'ignore'
+      stdio: verbose ? 'inherit' : 'ignore',
+      cwd: gitRoot
     });
   } catch {
     // Remote might already exist
   }
 
-  // Create Production branch reference
-  execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore' });
+  // Create Production branch reference (if it doesn't exist)
+  try {
+    execSync('git branch Production', { stdio: verbose ? 'inherit' : 'ignore', cwd: gitRoot });
+  } catch {
+    // Production branch might already exist
+    if (verbose) console.log('  Production branch already exists');
+  }
 
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
 
-export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<void> {
-  const { projectName, vaultDev, vaultProd, verbose } = options;
+export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
+  const { projectName, environments, verbose, force = false } = options;
+  const rollbackActions: RollbackAction[] = [];
 
-  // Get the script path relative to this module
-  const scriptPath = path.join(__dirname, '../scripts/op-service-account.sh');
-
-  if (!fs.existsSync(scriptPath)) {
-    throw new Error(`Service account script not found: ${scriptPath}`);
-  }
-
-  // Run the service account creation script
-  const username = execSync('gh api user -q .login', { encoding: 'utf-8' }).trim();
-  const repoFullName = `${username}/${projectName}`;
-
-  execSync(
-    `bash ${scriptPath} ${repoFullName} ${vaultDev} ${vaultProd}`,
-    { stdio: verbose ? 'inherit' : 'ignore' }
-  );
+  // Get GitHub owner and construct repo full name
+  const owner = getGitHubOwner();
+  const repo = `${owner}/${projectName}`;
 
   if (verbose) {
-    console.log('  Service account created');
-    console.log('  GitHub secrets configured');
+    console.log(`  Setting up GitHub secrets for ${repo}...`);
+    if (force) {
+      console.log(`  Force mode enabled - will reprovision all secrets`);
+    }
   }
+
+  let createdCount = 0;
+  let skippedCount = 0;
+
+  // Create service account and GitHub secrets for each environment
+  for (const env of environments) {
+    const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+
+    try {
+      const { rollbackActions: envRollback, skipped } = await setupServiceAccountAndSecrets({
+        projectName,
+        environment: env,
+        vaultName,
+        repo,
+        verbose,
+        force
+      });
+
+      rollbackActions.push(...envRollback);
+
+      if (skipped) {
+        skippedCount++;
+      } else {
+        createdCount++;
+      }
+    } catch (error: any) {
+      throw new Error(`Failed to setup service account for ${env}: ${error.message}`);
+    }
+  }
+
+  if (verbose) {
+    if (createdCount > 0) {
+      console.log(`  ✓ Service accounts created/updated: ${createdCount}`);
+    }
+    if (skippedCount > 0) {
+      console.log(`  ✓ Environments skipped (already configured): ${skippedCount}`);
+    }
+    console.log('  ✓ GitHub secrets configured');
+  } else if (createdCount > 0 || skippedCount > 0) {
+    if (createdCount > 0 && skippedCount > 0) {
+      console.log(`  ✓ GitHub secrets: ${createdCount} updated, ${skippedCount} skipped`);
+    } else if (createdCount > 0) {
+      console.log(`  ✓ GitHub secrets: ${createdCount} environment(s) configured`);
+    } else {
+      console.log(`  ✓ GitHub secrets: all environments already configured`);
+    }
+  }
+
+  return { rollbackActions };
 }
 
 export async function copyWorkflowTemplates(options: { projectName: string; verbose?: boolean }): Promise<void> {
   const { projectName, verbose } = options;
 
-  // Create .github/workflows directory
-  const workflowsDir = path.join(process.cwd(), '.github', 'workflows');
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Create .github/workflows directory at git root
+  const workflowsDir = path.join(gitRoot, '.github', 'workflows');
   fs.mkdirSync(workflowsDir, { recursive: true });
 
   // Get template directory
@@ -101,6 +174,10 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
   // Copy and customize workflow files
   const templates = fs.readdirSync(templatesDir).filter(f => f.endsWith('.yml'));
 
+  if (verbose) {
+    console.log(`  Copying workflows to: ${workflowsDir}`);
+  }
+
   for (const template of templates) {
     const templatePath = path.join(templatesDir, template);
     const targetPath = path.join(workflowsDir, template);
@@ -112,6 +189,210 @@ export async function copyWorkflowTemplates(options: { projectName: string; verb
 
     fs.writeFileSync(targetPath, content);
 
-    if (verbose) console.log(`  Copied ${template}`);
+    if (verbose) console.log(`  ✓ Copied ${template}`);
+  }
+
+  if (!verbose) {
+    console.log(`  ✓ Copied ${templates.length} workflow files to .github/workflows/`);
+  }
+}
+
+/**
+ * Copy script templates to user's project
+ */
+export async function copyScriptTemplates(options: { projectName: string; verbose?: boolean }): Promise<void> {
+  const { projectName, verbose } = options;
+
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Create scripts directory at git root
+  const scriptsDir = path.join(gitRoot, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+
+  // Get template directory
+  const templatesDir = path.join(__dirname, '../templates/scripts');
+
+  if (!fs.existsSync(templatesDir)) {
+    throw new Error(`Script templates not found: ${templatesDir}`);
+  }
+
+  // Copy script files
+  const scripts = fs.readdirSync(templatesDir).filter(f => f.endsWith('.js'));
+
+  if (verbose) {
+    console.log(`  Copying scripts to: ${scriptsDir}`);
+  }
+
+  for (const script of scripts) {
+    const templatePath = path.join(templatesDir, script);
+    const targetPath = path.join(scriptsDir, script);
+
+    let content = fs.readFileSync(templatePath, 'utf-8');
+
+    // Replace placeholders if any (currently none, but keeping for consistency)
+    content = content.replace(/\{\{PROJECT_NAME\}\}/g, projectName);
+
+    fs.writeFileSync(targetPath, content);
+
+    if (verbose) console.log(`  ✓ Copied ${script}`);
+  }
+
+  if (!verbose) {
+    console.log(`  ✓ Copied ${scripts.length} script files to scripts/`);
+  }
+}
+
+/**
+ * Copy CapRover configuration file to user's project
+ */
+export async function copyCapRoverConfig(options: { verbose?: boolean }): Promise<void> {
+  const { verbose } = options;
+
+  // Find git root directory (check current dir and parent)
+  let gitRoot = process.cwd();
+  if (!fs.existsSync(path.join(gitRoot, '.git'))) {
+    const parentDir = path.dirname(gitRoot);
+    if (fs.existsSync(path.join(parentDir, '.git'))) {
+      gitRoot = parentDir;
+      if (verbose) console.log(`  Found git repository in parent directory: ${gitRoot}`);
+    }
+  }
+
+  // Get template file path
+  const templatePath = path.join(__dirname, '../templates/captain-definition');
+
+  if (!fs.existsSync(templatePath)) {
+    throw new Error(`CapRover config template not found: ${templatePath}`);
+  }
+
+  // Copy to git root
+  const targetPath = path.join(gitRoot, 'captain-definition');
+  const content = fs.readFileSync(templatePath, 'utf-8');
+  fs.writeFileSync(targetPath, content);
+
+  if (verbose) {
+    console.log(`  ✓ Copied captain-definition to project root`);
+  } else {
+    console.log(`  ✓ Copied CapRover configuration`);
+  }
+}
+
+/**
+ * List all GitHub repositories for cleanup
+ */
+export async function listGitHubInstances(
+  options: { projectName?: string; envSuffix?: 'dev' | 'prod'; filterPattern?: string; verbose?: boolean }
+): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
+  const { projectName, filterPattern, verbose } = options;
+
+  try {
+    // Try to detect organization from current repo, otherwise use authenticated user
+    let owner: string;
+    try {
+      owner = execSync('gh repo view --json owner -q .owner.login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+    } catch {
+      // Fall back to authenticated user if not in a repo
+      owner = execSync('gh api user -q .login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+    }
+
+    // List repositories for the owner (org or user)
+    const output = execSync(`gh repo list "${owner}" --json name,createdAt,url,visibility --limit 1000`, {
+      stdio: 'pipe',
+      encoding: 'utf-8'
+    });
+    const repos = JSON.parse(output) as any[];
+
+    // Filter resources
+    let matches = repos;
+
+    if (filterPattern) {
+      // Use custom filter pattern
+      const pattern = filterPattern.toLowerCase();
+      matches = matches.filter((repo: any) => {
+        const name = (repo?.name || '').toLowerCase();
+        return name.includes(pattern);
+      });
+    } else if (projectName) {
+      // Filter by project name (GitHub repos don't have -dev/-prod suffix typically)
+      const pattern = projectName.toLowerCase();
+      matches = matches.filter((repo: any) => {
+        const name = (repo?.name || '').toLowerCase();
+        return name === pattern || name.startsWith(`${pattern}-`);
+      });
+    }
+    // If neither filterPattern nor projectName: return all resources
+
+    return matches.map((repo: any) => ({
+      id: `${owner}/${repo.name}`,
+      name: repo.name,
+      environment: 'unknown' as const,
+      metadata: {
+        url: repo.url,
+        visibility: repo.visibility
+      },
+      createdAt: repo.createdAt
+    }));
+  } catch (error: any) {
+    if (verbose) {
+      console.warn(`  Warning: Failed to list GitHub repositories: ${error?.message || error}`);
+    }
+    return [];
+  }
+}
+
+/**
+ * Delete a GitHub repository
+ */
+export async function deleteGitHubInstance(
+  instanceId: string,
+  options: { verbose?: boolean }
+): Promise<{ id: string; name: string; success: boolean; error?: string }> {
+  const { verbose } = options;
+
+  try {
+    // instanceId format: "username/repo-name"
+    const repoName = instanceId.split('/')[1] || instanceId;
+
+    // Delete repository with confirmation flag
+    execSync(`gh repo delete "${instanceId}" --yes`, {
+      stdio: verbose ? 'inherit' : 'pipe'
+    });
+
+    if (verbose) {
+      console.log(`    Deleted GitHub repository ${instanceId}`);
+    }
+
+    return {
+      id: instanceId,
+      name: repoName,
+      success: true
+    };
+  } catch (error: any) {
+    const errorMsg = error?.message || String(error);
+
+    // Check for missing delete_repo scope
+    if (errorMsg.includes('delete_repo')) {
+      return {
+        id: instanceId,
+        name: instanceId.split('/')[1] || instanceId,
+        success: false,
+        error: 'Missing delete_repo scope. Run: gh auth refresh -h github.com -s delete_repo'
+      };
+    }
+
+    return {
+      id: instanceId,
+      name: instanceId.split('/')[1] || instanceId,
+      success: false,
+      error: errorMsg
+    };
   }
 }
