@@ -32,23 +32,13 @@ jobs:
       - name: Install Wasp
         run: curl -sSL https://get.wasp-lang.dev/installer.sh | sh
 
-      - name: Load secrets from 1Password
+      - name: Load CI/CD secrets from 1Password
         uses: 1password/load-secrets-action@v2
         with:
           export-env: true
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          DATABASE_URL: op://${{ secrets.OP_VAULT }}/Neon/Database/database_url
-          JWT_SECRET: op://${{ secrets.OP_VAULT }}/Auth/Secrets/jwt_secret
-          STRIPE_API_KEY: op://${{ secrets.OP_VAULT }}/Stripe/Credentials/api_key
-          STRIPE_WEBHOOK_SECRET: op://${{ secrets.OP_VAULT }}/Stripe/Credentials/webhook_secret
-          SENDGRID_API_KEY: op://${{ secrets.OP_VAULT }}/Sendgrid/Credentials/api_key
-          RESEND_API_KEY: op://${{ secrets.OP_VAULT }}/Resend/Credentials/api_key
-          AWS_S3_IAM_ACCESS_KEY: op://${{ secrets.OP_VAULT }}/AWS/Credentials/access_key
-          AWS_S3_IAM_SECRET_KEY: op://${{ secrets.OP_VAULT }}/AWS/Credentials/secret_key
-          AWS_S3_FILES_BUCKET: op://${{ secrets.OP_VAULT }}/AWS/Configuration/files_bucket
-          GOOGLE_CLIENT_ID: op://${{ secrets.OP_VAULT }}/Google/OAuth/client_id
-          GOOGLE_CLIENT_SECRET: op://${{ secrets.OP_VAULT }}/Google/OAuth/client_secret
+          # CI/CD deployment credentials only - runtime secrets loaded by serverSetup.ts
           CAPROVER_URL: op://${{ secrets.OP_VAULT }}/CapRover/Server/url
           CAPROVER_APP_TOKEN: op://${{ secrets.OP_VAULT }}/CapRover/Deployment/app_token
           VERCEL_TOKEN: op://${{ secrets.OP_VAULT }}/Vercel/Credentials/token
@@ -56,13 +46,13 @@ jobs:
           VERCEL_ORG_ID: op://${{ secrets.OP_VAULT }}/Vercel/Organization/org_id
           API_URL: op://${{ secrets.OP_VAULT }}/CapRover/URLs/api_url
           APP_URL: op://${{ secrets.OP_VAULT }}/Vercel/URLs/app_url
+          GITHUB_PAT: op://${{ secrets.OP_VAULT }}/GitHub/Credentials/pat
+          GITHUB_USERNAME: op://${{ secrets.OP_VAULT }}/GitHub/Registry/username
+          # Migration secret needed for build-time database access
+          DATABASE_URL: op://${{ secrets.OP_VAULT }}/Neon/Database/database_url
 
-      - name: Validate required environment variables
+      - name: Validate CI/CD environment variables
         run: node ../scripts/validate-env.js
-        working-directory: app
-
-      - name: Build .env.server
-        run: node ../scripts/generate-env-server.js
         working-directory: app
 
       - name: Build .env.client
@@ -72,10 +62,21 @@ jobs:
       - name: Build Wasp project
         run: wasp build
         working-directory: app
+        env:
+          WASP_WEB_CLIENT_URL: ${{ env.APP_URL }}
+          WASP_SERVER_URL: ${{ env.API_URL }}
 
       - name: Build frontend static files
         run: npm run build
         working-directory: app/.wasp/build/web-app
+        env:
+          REACT_APP_API_URL: ${{ env.API_URL }}
+          WASP_WEB_CLIENT_URL: ${{ env.APP_URL }}
+          WASP_SERVER_URL: ${{ env.API_URL }}
+
+      - name: Login to GitHub Container Registry
+        if: env.GITHUB_PAT != '' && env.GITHUB_USERNAME != ''
+        run: echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
 
       - name: Prepare Vercel Build Output API structure
         run: |
@@ -126,7 +127,7 @@ jobs:
           VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
 
       - name: Run database migrations
-        working-directory: app
+        working-directory: app/.wasp/build/server
         run: |
           export DATABASE_URL="${DATABASE_URL}"
-          wasp db migrate-deploy
+          npx prisma migrate deploy --schema=../db/schema.prisma

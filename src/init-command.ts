@@ -83,6 +83,12 @@ export async function initCommand(options: InitOptions = {}): Promise<void> {
     await setupResendCredentials(vaultName, verbose);
   }
 
+  // GitHub
+  const setupGitHub = await promptConfirm('Set up GitHub (Container Registry access)?', false);
+  if (setupGitHub) {
+    await setupGitHubCredentials(vaultName, verbose);
+  }
+
   console.log('\n✅ Initialization complete!\n');
   console.log('You can now run provisioning commands without environment variables:\n');
   console.log('  provision-wasp-saas --provision-neon --env prod\n');
@@ -302,4 +308,47 @@ async function setupResendCredentials(vaultName: string, verbose?: boolean): Pro
 
   opEnsureItemWithSections(vaultName, 'Resend', sections, 'SECURE_NOTE', verbose);
   console.log('   ✓ Saved Resend credentials');
+}
+
+async function setupGitHubCredentials(vaultName: string, verbose?: boolean): Promise<void> {
+  console.log('\n🐙 GitHub');
+  console.log('   Get PAT from: https://github.com/settings/tokens');
+  console.log('   Required scopes: read:packages, write:packages, delete:packages\n');
+
+  // Check if item already exists
+  const existingItem = opGetItem(vaultName, 'GitHub');
+  if (existingItem) {
+    const overwrite = await promptConfirm('I already have this entry, do you want to overwrite?', false);
+    if (!overwrite) {
+      console.log('   Skipped GitHub (keeping existing credentials)');
+      return;
+    }
+  }
+
+  const pat = await promptSecret('GitHub Personal Access Token (required for GHCR)');
+  if (!pat) {
+    console.log('   Skipped GitHub setup');
+    return;
+  }
+
+  const username = await promptText('GitHub Username', '');
+
+  const sections: ItemSection[] = [
+    {
+      label: 'Credentials',
+      fields: [
+        { label: 'pat', value: pat, type: 'CONCEALED' }
+      ]
+    }
+  ];
+
+  if (username) {
+    sections.push({
+      label: 'Registry',
+      fields: [{ label: 'username', value: username, type: 'STRING' }]
+    });
+  }
+
+  opEnsureItemWithSections(vaultName, 'GitHub', sections, 'SECURE_NOTE', verbose);
+  console.log('   ✓ Saved GitHub credentials');
 }

@@ -262,6 +262,8 @@ export function createGitHubSecretRollback(
 /**
  * Setup service account and GitHub secrets for an environment
  * This is the main function that orchestrates everything
+ *
+ * Optionally updates CapRover app environment variables if caprover option is provided
  */
 export async function setupServiceAccountAndSecrets(options: {
   projectName: string;
@@ -270,6 +272,11 @@ export async function setupServiceAccountAndSecrets(options: {
   repo: string;
   verbose?: boolean;
   force?: boolean;
+  caprover?: {
+    appName: string;
+    url?: string;
+    password?: string;
+  };
 }): Promise<{ rollbackActions: RollbackAction[]; skipped: boolean }> {
   const { projectName, environment, vaultName, repo, verbose, force = false } = options;
   const rollbackActions: RollbackAction[] = [];
@@ -339,6 +346,40 @@ export async function setupServiceAccountAndSecrets(options: {
 
     if (verbose) {
       console.log(`  ✓ Service account and secrets configured for ${environment}`);
+    }
+
+    // Update CapRover environment variables if requested
+    if (options.caprover) {
+      try {
+        const { updateCapRoverEnvVars } = await import('./caprover-provision.js');
+
+        if (verbose) {
+          console.log(`  Updating CapRover app environment variables...`);
+        }
+
+        await updateCapRoverEnvVars(
+          options.caprover.appName,
+          [
+            { key: 'OP_SERVICE_ACCOUNT_TOKEN', value: serviceAccount.token },
+            { key: 'OP_VAULT', value: vaultName }
+          ],
+          {
+            url: options.caprover.url,
+            password: options.caprover.password,
+            verbose
+          }
+        );
+
+        if (verbose) {
+          console.log(`  ✓ CapRover environment variables updated`);
+        }
+      } catch (error: any) {
+        // Don't fail the entire operation if CapRover update fails
+        console.warn(`  Warning: Failed to update CapRover env vars: ${error.message}`);
+        console.warn(`  You can manually set these in CapRover:`);
+        console.warn(`    - OP_SERVICE_ACCOUNT_TOKEN`);
+        console.warn(`    - OP_VAULT=${vaultName}`);
+      }
     }
 
     return { rollbackActions, skipped: false };

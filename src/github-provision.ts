@@ -23,6 +23,7 @@ export interface GitHubSecretsOptions {
   environments: Array<'dev' | 'prod'>;
   verbose?: boolean;
   force?: boolean;
+  updateCapRover?: boolean; // If true, also update CapRover app env vars
 }
 
 export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void> {
@@ -83,7 +84,7 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
 }
 
 export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
-  const { projectName, environments, verbose, force = false } = options;
+  const { projectName, environments, verbose, force = false, updateCapRover = false } = options;
   const rollbackActions: RollbackAction[] = [];
 
   // Get GitHub owner and construct repo full name
@@ -95,14 +96,29 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
     if (force) {
       console.log(`  Force mode enabled - will reprovision all secrets`);
     }
+    if (updateCapRover) {
+      console.log(`  Will also update CapRover environment variables`);
+    }
   }
 
   let createdCount = 0;
   let skippedCount = 0;
 
+  // Get CapRover credentials if we need to update apps
+  let caproverCredentials: { url?: string; password?: string } = {};
+  if (updateCapRover) {
+    const { getCapRoverCredentials } = await import('./credentials.js');
+    const creds = getCapRoverCredentials();
+    caproverCredentials = {
+      url: creds.url ?? undefined,
+      password: creds.password ?? undefined
+    };
+  }
+
   // Create service account and GitHub secrets for each environment
   for (const env of environments) {
     const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+    const appName = updateCapRover ? `${projectName}-api-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-') : undefined;
 
     try {
       const { rollbackActions: envRollback, skipped } = await setupServiceAccountAndSecrets({
@@ -111,7 +127,12 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
         vaultName,
         repo,
         verbose,
-        force
+        force,
+        caprover: updateCapRover && appName ? {
+          appName,
+          url: caproverCredentials.url,
+          password: caproverCredentials.password
+        } : undefined
       });
 
       rollbackActions.push(...envRollback);

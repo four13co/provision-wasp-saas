@@ -466,6 +466,126 @@ export async function listCapRoverInstances(
 }
 
 /**
+ * Update environment variables for a CapRover app
+ */
+export async function updateCapRoverEnvVars(
+  appName: string,
+  envVars: Array<{ key: string; value: string }>,
+  options: { url?: string; password?: string; verbose?: boolean } = {}
+): Promise<void> {
+  const { verbose } = options;
+
+  // Get credentials from options or environment
+  const credentials = options.url && options.password
+    ? { url: options.url, password: options.password }
+    : getCapRoverCredentials();
+
+  const url = credentials.url;
+  const password = credentials.password;
+
+  if (!url) {
+    throw new Error('CapRover URL not provided');
+  }
+
+  if (!password) {
+    throw new Error('CapRover password not provided');
+  }
+
+  const base = apiBase(url);
+
+  try {
+    // Login to CapRover API
+    const res = await fetch(`${base}/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
+      body: new URLSearchParams({ password })
+    });
+
+    const login = await res.json().catch(() => ({} as any)) as any;
+    const token = login?.data?.token;
+
+    if (!token) {
+      throw new Error('Failed to authenticate with CapRover API');
+    }
+
+    // Get current app definition
+    const defs = await fetch(`${base}/user/apps/appDefinitions/`, {
+      headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+    });
+
+    const defsJson = defs.ok ? await defs.json().catch(() => null) : null as any;
+    const list = defsJson?.data?.appDefinitions || [];
+    const current = list.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
+
+    if (!current) {
+      throw new Error(`App '${appName}' not found in CapRover`);
+    }
+
+    // Merge new environment variables with existing ones
+    const existingEnvVars = current.envVars || [];
+    const updatedEnvVars = [...existingEnvVars];
+
+    // Update or add each environment variable
+    for (const { key, value } of envVars) {
+      const existingIndex = updatedEnvVars.findIndex((ev: any) => ev.key === key);
+      if (existingIndex >= 0) {
+        updatedEnvVars[existingIndex].value = value;
+        if (verbose) {
+          console.log(`  Updated env var: ${key}`);
+        }
+      } else {
+        updatedEnvVars.push({ key, value });
+        if (verbose) {
+          console.log(`  Added env var: ${key}`);
+        }
+      }
+    }
+
+    // Update app definition with new environment variables
+    const body: any = {
+      appName,
+      projectId: current.projectId || '',
+      description: current.description || '',
+      instanceCount: current.instanceCount ?? 1,
+      captainDefinitionRelativeFilePath: current.captainDefinitionRelativeFilePath || 'captain-definition',
+      envVars: updatedEnvVars,
+      volumes: current.volumes || [],
+      tags: current.tags || [],
+      nodeId: current.nodeId || '',
+      notExposeAsWebApp: !!current.notExposeAsWebApp,
+      containerHttpPort: current.containerHttpPort || 80,
+      httpAuth: current.httpAuth || undefined,
+      forceSsl: !!current.forceSsl,
+      ports: current.ports || [],
+      appPushWebhook: current.appPushWebhook ? { repoInfo: current.appPushWebhook.repoInfo || {} } : undefined,
+      customNginxConfig: current.customNginxConfig || '',
+      redirectDomain: current.redirectDomain || '',
+      preDeployFunction: current.preDeployFunction || '',
+      serviceUpdateOverride: current.serviceUpdateOverride || '',
+      websocketSupport: !!current.websocketSupport,
+      appDeployTokenConfig: current.appDeployTokenConfig || { enabled: false }
+    };
+
+    const updateRes = await fetch(`${base}/user/apps/appDefinitions/update/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+      body: JSON.stringify(body)
+    });
+
+    if (!updateRes.ok) {
+      const errorText = await updateRes.text().catch(() => '');
+      throw new Error(`Failed to update app: ${updateRes.status} ${errorText}`);
+    }
+
+    if (verbose) {
+      console.log(`  ✓ Updated environment variables for ${appName}`);
+    }
+  } catch (e: any) {
+    throw new Error(`Failed to update CapRover env vars: ${e?.message || e}`);
+  }
+}
+
+/**
  * Delete a CapRover app by name
  */
 export async function deleteCapRoverInstance(
