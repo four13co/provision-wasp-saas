@@ -7,11 +7,12 @@
  */
 
 import { execSync } from 'node:child_process';
-import { ensureOpAuth, opGetItem, opItemField, opEnsureVault, opReadRef, opEnsureItemWithSections, ItemSection } from './op-util.js';
+import { ensureOpAuth, opGetItem, opItemField, opEnsureVault, opReadRef, opEnsureItemWithSections, ItemSection, ItemField, opReadField } from './op-util.js';
 import { ProvisionOptions, CapRoverResult } from './types.js';
 import { createRollbackAction, RollbackAction } from './rollback.js';
 import { getCapRoverCredentials, getMissingCredentialsMessage } from './credentials.js';
 import { retry } from './retry-util.js';
+import { createServiceAccount } from './service-account.js';
 
 function sh(cmd: string, verbose?: boolean) {
   if (verbose) console.log(`$ ${cmd}`);
@@ -29,7 +30,7 @@ function apiBase(u: string) {
 export async function provisionCapRover(
   options: ProvisionOptions
 ): Promise<{ result: CapRoverResult; rollbackActions: RollbackAction[] }> {
-  const { projectName, envSuffix, verbose, dryRun } = options;
+  const { projectName, envSuffix, verbose, dryRun, force = false } = options;
   const rollbackActions: RollbackAction[] = [];
 
   const appName = `${projectName}-api-${envSuffix}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
@@ -83,52 +84,98 @@ export async function provisionCapRover(
       throw new Error('Failed to authenticate with CapRover API');
     }
 
-    // Register app
-    res = await fetch(`${base}/user/apps/appDefinitions/register/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
-      body: JSON.stringify({ appName })
+    // Check if app already exists
+    const defsRes = await fetch(`${base}/user/apps/appDefinitions/`, {
+      headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
     });
 
-    if (!res.ok) {
-      // Try alternative path variant
-      res = await fetch(`${base}/user/apps/appDefinitions/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
-        body: JSON.stringify({ appName })
-      });
+    const defsJson = defsRes.ok ? await defsRes.json().catch(() => null) : null as any;
+    const existingApps = defsJson?.data?.appDefinitions || [];
+    const existingApp = existingApps.find((a: any) => (a?.appName || '').toLowerCase() === appName.toLowerCase());
 
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        throw new Error(`Failed to register CapRover app: ${res.status} ${errorText}`);
+    if (existingApp) {
+      // App already exists - retrieve its details
+      appToken = existingApp?.appDeployTokenConfig?.appDeployToken || '';
+
+      try {
+        const u = new URL(url);
+        const host = u.hostname.replace(/^captain\./, '');
+        apiUrl = `https://${appName}.${host}`;
+      } catch (e: any) {
+        if (verbose) {
+          console.warn(`  Warning: Could not compute API URL: ${e?.message || e}`);
+        }
+      }
+
+      if (verbose) {
+        console.log(`  ✓ CapRover app already exists: ${appName}`);
+      }
+
+      // Skip to vault writing and service account setup
+    } else {
+    // Register app with retry logic for 429 "operation in progress" errors
+    const maxRetries = 3;
+    let registrationSuccess = false;
+
+    for (let attempt = 0; attempt < maxRetries && !registrationSuccess; attempt++) {
+      try {
+        res = await fetch(`${base}/user/apps/appDefinitions/register/`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+          body: JSON.stringify({ appName })
+        });
+
+        if (!res.ok) {
+          // Try alternative path variant
+          res = await fetch(`${base}/user/apps/appDefinitions/register`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+            body: JSON.stringify({ appName })
+          });
+        }
+
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => '');
+
+          // Check for 429 "operation in progress" error
+          if (res.status === 429 && errorText.toLowerCase().includes('operation still in progress')) {
+            if (attempt < maxRetries - 1) {
+              const waitSeconds = 90;
+              if (verbose) {
+                console.log(`  ⚠️  CapRover operation in progress, waiting ${waitSeconds} seconds before retry...`);
+              } else {
+                console.log(`  ⏳ Waiting for CapRover operation to complete (${waitSeconds}s)...`);
+              }
+
+              // Wait 90 seconds before retrying
+              await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+              continue; // Retry
+            } else {
+              throw new Error(`Failed to register CapRover app after ${maxRetries} attempts: ${res.status} ${errorText}`);
+            }
+          } else {
+            // Other error, don't retry
+            throw new Error(`Failed to register CapRover app: ${res.status} ${errorText}`);
+          }
+        }
+
+        registrationSuccess = true;
+      } catch (error: any) {
+        if (attempt === maxRetries - 1) {
+          throw error;
+        }
+        // If it's a fetch error (not HTTP error), retry after 5 seconds
+        if (verbose) {
+          console.log(`  ⚠️  Registration attempt ${attempt + 1}/${maxRetries} failed: ${error.message}`);
+          console.log(`  🔄 Retrying in 5 seconds...`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
 
     if (verbose) {
       console.log(`  ✓ Registered CapRover app: ${appName}`);
     }
-
-    // Add rollback action to delete the app
-    rollbackActions.push(
-      createRollbackAction(
-        'caprover',
-        `Delete CapRover app ${appName}`,
-        async () => {
-          try {
-            await fetch(`${base}/user/apps/appDefinitions/delete/`, {
-              method: 'POST',
-              headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
-              body: JSON.stringify({ appName })
-            });
-            if (verbose) {
-              console.log(`    Deleted CapRover app ${appName}`);
-            }
-          } catch (e: any) {
-            console.warn(`    Failed to delete CapRover app: ${e?.message || e}`);
-          }
-        }
-      )
-    );
 
     // Enable HTTPS for the app's base domain
     try {
@@ -254,6 +301,215 @@ export async function provisionCapRover(
       }
     }
 
+      // Add rollback action only for newly created apps
+      rollbackActions.push(
+        createRollbackAction(
+          'caprover',
+          `Delete CapRover app ${appName}`,
+          async () => {
+            try {
+              await fetch(`${base}/user/apps/appDefinitions/delete/`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+                body: JSON.stringify({ appName })
+              });
+              if (verbose) {
+                console.log(`    Deleted CapRover app ${appName}`);
+              }
+            } catch (e: any) {
+              console.warn(`    Failed to delete CapRover app: ${e?.message || e}`);
+            }
+          }
+        )
+      );
+    } // End of "else" block for new app creation
+
+    // Create service account and set CapRover environment variables
+    let serviceAccountToken = '';
+    let serviceAccountName = '';
+
+    try {
+      // Check if service account already exists for this environment
+      ensureOpAuth();
+      opEnsureVault(vaultName);
+
+      const existingServiceAccountName = opReadField(vaultName, 'CapRover', 'ServiceAccount', 'service_account_name');
+
+      if (existingServiceAccountName && !force) {
+        if (verbose) {
+          console.log(`  ✓ Service account already exists: ${existingServiceAccountName}`);
+        }
+        serviceAccountName = existingServiceAccountName;
+
+        // Retrieve the token from vault for env var setting
+        const existingToken = opReadField(vaultName, 'CapRover', 'ServiceAccount', 'token');
+        if (existingToken) {
+          serviceAccountToken = existingToken;
+          if (verbose) {
+            console.log(`  ✓ Retrieved service account token from vault`);
+          }
+        } else {
+          console.warn(`  Warning: Service account exists but token not found in vault`);
+          console.warn(`  You may need to manually set OP_SERVICE_ACCOUNT_TOKEN in CapRover`);
+        }
+      } else {
+        // Create new service account (or force recreation)
+        if (existingServiceAccountName && force) {
+          console.log(`  🔄 Force mode: Recreating service account (old: ${existingServiceAccountName})`);
+        } else if (verbose) {
+          console.log(`  Creating service account for CapRover...`);
+        }
+
+        const timestamp = new Date().toISOString().replace(/[-:T.]/g, '').substring(0, 14);
+        serviceAccountName = `${projectName}-sa-${envSuffix}-caprover-v${timestamp}`;
+
+        const serviceAccount = await createServiceAccount({
+          name: serviceAccountName,
+          vault: vaultName,
+          permissions: ['read_items'],
+          verbose
+        });
+
+        serviceAccountToken = serviceAccount.token;
+
+        if (verbose) {
+          console.log(`  ✓ Service account created: ${serviceAccountName}`);
+        }
+      }
+    } catch (e: any) {
+      console.warn(`  Warning: Failed to setup service account: ${e?.message || e}`);
+      console.warn(`  CapRover app created but won't have 1Password integration`);
+    }
+
+    // Set CapRover environment variables (always attempt if we have the token)
+    if (serviceAccountToken) {
+      try {
+        if (verbose) {
+          console.log(`  Setting CapRover environment variables...`);
+        }
+
+        // Read GitHub credentials from vault for GHCR authentication
+        let githubPat: string | null = null;
+        let githubUsername: string | null = null;
+        try {
+          githubPat = opReadField(vaultName, 'GitHub', 'Credentials', 'pat');
+          githubUsername = opReadField(vaultName, 'GitHub', 'Registry', 'username');
+        } catch (e: any) {
+          if (verbose) {
+            console.log(`  Note: GitHub credentials not found in vault (${e?.message || e})`);
+            console.log(`  Skipping GITHUB_PAT and GITHUB_USERNAME env vars`);
+          }
+        }
+
+        // Build env vars array
+        const envVars: Array<{ key: string; value: string }> = [
+          { key: 'OP_SERVICE_ACCOUNT_TOKEN', value: serviceAccountToken },
+          { key: 'OP_VAULT', value: vaultName }
+        ];
+
+        // Add GitHub credentials if available
+        if (githubPat && githubUsername) {
+          envVars.push(
+            { key: 'GITHUB_PAT', value: githubPat },
+            { key: 'GITHUB_USERNAME', value: githubUsername }
+          );
+          if (verbose) {
+            console.log(`  Including GitHub credentials for GHCR authentication`);
+          }
+        }
+
+        // Wait a moment for CapRover to fully initialize the app before setting env vars
+        if (!existingApp) {
+          if (verbose) {
+            console.log(`  Waiting 5 seconds for CapRover app initialization...`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+
+        await updateCapRoverEnvVars(
+          appName,
+          envVars,
+          { url, password, verbose }
+        );
+
+        // Verify env vars were set by reading them back
+        try {
+          const { getCapRoverCredentials } = await import('./credentials.js');
+          const credentials = url && password
+            ? { url, password }
+            : getCapRoverCredentials();
+
+          const verifyUrl = credentials.url ?? '';
+          const verifyPassword = credentials.password ?? '';
+
+          if (!verifyUrl || !verifyPassword) {
+            throw new Error('Missing credentials for verification');
+          }
+
+          const base = apiBase(verifyUrl);
+
+          // Login
+          const loginRes = await fetch(`${base}/login`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
+            body: new URLSearchParams({ password: verifyPassword })
+          });
+          const loginJson = await loginRes.json().catch(() => ({} as any)) as any;
+          const token = loginJson?.data?.token;
+
+          if (token) {
+            // Get app definition
+            const defsRes = await fetch(`${base}/user/apps/appDefinitions/`, {
+              headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+            });
+            const defsJson = await defsRes.json().catch(() => null) as any;
+            const apps = defsJson?.data?.appDefinitions || [];
+            const app = apps.find((a: any) => (a?.appName || '').toLowerCase() === appName.toLowerCase());
+
+            if (app && app.envVars) {
+              const hasOpToken = app.envVars.some((ev: any) => ev.key === 'OP_SERVICE_ACCOUNT_TOKEN');
+              const hasOpVault = app.envVars.some((ev: any) => ev.key === 'OP_VAULT');
+              const hasGithubPat = app.envVars.some((ev: any) => ev.key === 'GITHUB_PAT');
+              const hasGithubUsername = app.envVars.some((ev: any) => ev.key === 'GITHUB_USERNAME');
+
+              const requiredVarsSet = hasOpToken && hasOpVault;
+              const githubVarsSet = hasGithubPat && hasGithubUsername;
+              const githubVarsExpected = githubPat && githubUsername;
+
+              if (requiredVarsSet) {
+                if (githubVarsExpected && githubVarsSet) {
+                  console.log(`  ✓ CapRover environment variables verified (including GitHub credentials)`);
+                } else if (githubVarsExpected && !githubVarsSet) {
+                  console.warn(`  ⚠️  Required vars set but GitHub credentials missing in CapRover`);
+                } else {
+                  console.log(`  ✓ CapRover environment variables verified`);
+                }
+              } else {
+                console.warn(`  ⚠️  Environment variables partially set (OP_TOKEN: ${hasOpToken}, OP_VAULT: ${hasOpVault})`);
+              }
+            }
+          }
+        } catch (verifyError: any) {
+          // Verification failed, but env vars might still be set
+          if (verbose) {
+            console.log(`  ✓ CapRover environment variables set (verification skipped: ${verifyError.message})`);
+          } else {
+            console.log(`  ✓ CapRover environment variables set`);
+          }
+        }
+      } catch (e: any) {
+        // Always show this warning, not just in verbose mode
+        console.warn(`  ⚠️  Failed to set CapRover env vars: ${e?.message || e}`);
+        console.warn(`  Please manually set these in CapRover dashboard:`);
+        console.warn(`    - OP_SERVICE_ACCOUNT_TOKEN`);
+        console.warn(`    - OP_VAULT=${vaultName}`);
+      }
+    } else if (serviceAccountName) {
+      // Service account exists but we don't have the token
+      console.warn(`  ⚠️  Service account exists but token not available`);
+      console.warn(`  Please verify OP_SERVICE_ACCOUNT_TOKEN is set in CapRover`);
+    }
+
     // Write to 1Password project vault
     try {
       ensureOpAuth();
@@ -292,6 +548,28 @@ export async function provisionCapRover(
           fields: [
             { label: 'api_url', value: apiUrl, type: 'URL' }
           ]
+        });
+      }
+
+      // Add service account metadata if available
+      if (serviceAccountName) {
+        const serviceAccountFields: ItemField[] = [
+          { label: 'service_account_name', value: serviceAccountName, type: 'STRING' },
+          { label: 'created_at', value: new Date().toISOString(), type: 'STRING' }
+        ];
+
+        // Add token if we just created the service account
+        if (serviceAccountToken) {
+          serviceAccountFields.push({
+            label: 'token',
+            value: serviceAccountToken,
+            type: 'CONCEALED'
+          });
+        }
+
+        caproverSections.push({
+          label: 'ServiceAccount',
+          fields: serviceAccountFields
         });
       }
 
@@ -493,96 +771,121 @@ export async function updateCapRoverEnvVars(
 
   const base = apiBase(url);
 
-  try {
-    // Login to CapRover API
-    const res = await fetch(`${base}/login`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
-      body: new URLSearchParams({ password })
-    });
+  // Retry logic for env var updates
+  const maxRetries = 3;
+  let lastError: Error | null = null;
 
-    const login = await res.json().catch(() => ({} as any)) as any;
-    const token = login?.data?.token;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      // Login to CapRover API
+      const res = await fetch(`${base}/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
+        body: new URLSearchParams({ password })
+      });
 
-    if (!token) {
-      throw new Error('Failed to authenticate with CapRover API');
-    }
+      const login = await res.json().catch(() => ({} as any)) as any;
+      const token = login?.data?.token;
 
-    // Get current app definition
-    const defs = await fetch(`${base}/user/apps/appDefinitions/`, {
-      headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-    });
+      if (!token) {
+        throw new Error('Failed to authenticate with CapRover API');
+      }
 
-    const defsJson = defs.ok ? await defs.json().catch(() => null) : null as any;
-    const list = defsJson?.data?.appDefinitions || [];
-    const current = list.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
+      // Get current app definition
+      const defs = await fetch(`${base}/user/apps/appDefinitions/`, {
+        headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+      });
 
-    if (!current) {
-      throw new Error(`App '${appName}' not found in CapRover`);
-    }
+      const defsJson = defs.ok ? await defs.json().catch(() => null) : null as any;
+      const list = defsJson?.data?.appDefinitions || [];
+      const current = list.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
 
-    // Merge new environment variables with existing ones
-    const existingEnvVars = current.envVars || [];
-    const updatedEnvVars = [...existingEnvVars];
+      if (!current) {
+        throw new Error(`App '${appName}' not found in CapRover`);
+      }
 
-    // Update or add each environment variable
-    for (const { key, value } of envVars) {
-      const existingIndex = updatedEnvVars.findIndex((ev: any) => ev.key === key);
-      if (existingIndex >= 0) {
-        updatedEnvVars[existingIndex].value = value;
-        if (verbose) {
-          console.log(`  Updated env var: ${key}`);
-        }
-      } else {
-        updatedEnvVars.push({ key, value });
-        if (verbose) {
-          console.log(`  Added env var: ${key}`);
+      // Merge new environment variables with existing ones
+      const existingEnvVars = current.envVars || [];
+      const updatedEnvVars = [...existingEnvVars];
+
+      // Update or add each environment variable
+      for (const { key, value } of envVars) {
+        const existingIndex = updatedEnvVars.findIndex((ev: any) => ev.key === key);
+        if (existingIndex >= 0) {
+          updatedEnvVars[existingIndex].value = value;
+          if (verbose) {
+            console.log(`  Updated env var: ${key}`);
+          }
+        } else {
+          updatedEnvVars.push({ key, value });
+          if (verbose) {
+            console.log(`  Added env var: ${key}`);
+          }
         }
       }
+
+      // Update app definition with new environment variables
+      const body: any = {
+        appName,
+        projectId: current.projectId || '',
+        description: current.description || '',
+        instanceCount: current.instanceCount ?? 1,
+        captainDefinitionRelativeFilePath: current.captainDefinitionRelativeFilePath || 'captain-definition',
+        envVars: updatedEnvVars,
+        volumes: current.volumes || [],
+        tags: current.tags || [],
+        nodeId: current.nodeId || '',
+        notExposeAsWebApp: !!current.notExposeAsWebApp,
+        containerHttpPort: current.containerHttpPort || 80,
+        httpAuth: current.httpAuth || undefined,
+        forceSsl: !!current.forceSsl,
+        ports: current.ports || [],
+        appPushWebhook: current.appPushWebhook ? { repoInfo: current.appPushWebhook.repoInfo || {} } : undefined,
+        customNginxConfig: current.customNginxConfig || '',
+        redirectDomain: current.redirectDomain || '',
+        preDeployFunction: current.preDeployFunction || '',
+        serviceUpdateOverride: current.serviceUpdateOverride || '',
+        websocketSupport: !!current.websocketSupport,
+        appDeployTokenConfig: current.appDeployTokenConfig || { enabled: false }
+      };
+
+      const updateRes = await fetch(`${base}/user/apps/appDefinitions/update/`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+        body: JSON.stringify(body)
+      });
+
+      if (!updateRes.ok) {
+        const errorText = await updateRes.text().catch(() => '');
+        throw new Error(`Failed to update app: ${updateRes.status} ${errorText}`);
+      }
+
+      if (verbose) {
+        console.log(`  ✓ Updated environment variables for ${appName}`);
+      }
+
+      // Success - exit retry loop
+      return;
+    } catch (e: any) {
+      lastError = e;
+
+      // Don't retry on last attempt
+      if (attempt === maxRetries - 1) {
+        break;
+      }
+
+      // Retry after a delay
+      const delaySeconds = 10;
+      if (verbose) {
+        console.log(`  ⚠️  Env var update attempt ${attempt + 1}/${maxRetries} failed: ${e?.message || e}`);
+        console.log(`  🔄 Retrying in ${delaySeconds} seconds...`);
+      }
+      await new Promise(resolve => setTimeout(resolve, delaySeconds * 1000));
     }
-
-    // Update app definition with new environment variables
-    const body: any = {
-      appName,
-      projectId: current.projectId || '',
-      description: current.description || '',
-      instanceCount: current.instanceCount ?? 1,
-      captainDefinitionRelativeFilePath: current.captainDefinitionRelativeFilePath || 'captain-definition',
-      envVars: updatedEnvVars,
-      volumes: current.volumes || [],
-      tags: current.tags || [],
-      nodeId: current.nodeId || '',
-      notExposeAsWebApp: !!current.notExposeAsWebApp,
-      containerHttpPort: current.containerHttpPort || 80,
-      httpAuth: current.httpAuth || undefined,
-      forceSsl: !!current.forceSsl,
-      ports: current.ports || [],
-      appPushWebhook: current.appPushWebhook ? { repoInfo: current.appPushWebhook.repoInfo || {} } : undefined,
-      customNginxConfig: current.customNginxConfig || '',
-      redirectDomain: current.redirectDomain || '',
-      preDeployFunction: current.preDeployFunction || '',
-      serviceUpdateOverride: current.serviceUpdateOverride || '',
-      websocketSupport: !!current.websocketSupport,
-      appDeployTokenConfig: current.appDeployTokenConfig || { enabled: false }
-    };
-
-    const updateRes = await fetch(`${base}/user/apps/appDefinitions/update/`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
-      body: JSON.stringify(body)
-    });
-
-    if (!updateRes.ok) {
-      const errorText = await updateRes.text().catch(() => '');
-      throw new Error(`Failed to update app: ${updateRes.status} ${errorText}`);
-    }
-
-    if (verbose) {
-      console.log(`  ✓ Updated environment variables for ${appName}`);
-    }
-  } catch (e: any) {
-    throw new Error(`Failed to update CapRover env vars: ${e?.message || e}`);
   }
+
+  // All retries exhausted
+  throw new Error(`Failed to update CapRover env vars: ${lastError?.message || lastError}`);
 }
 
 /**

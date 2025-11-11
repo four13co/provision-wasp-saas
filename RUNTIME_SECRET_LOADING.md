@@ -225,9 +225,9 @@ The server will now load secrets at runtime instead of using baked-in values.
 
 ✅ **DO:**
 - Use separate service accounts for dev and prod
-- Set service account tokens to expire (90 days recommended)
 - Use separate vaults for different environments
 - Monitor 1Password access logs
+- Rotate service account tokens periodically for security
 
 ❌ **DON'T:**
 - Set actual application secrets as CapRover environment variables

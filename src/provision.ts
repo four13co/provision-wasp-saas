@@ -136,7 +136,8 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
               projectName,
               envSuffix: env,
               verbose,
-              dryRun
+              dryRun,
+              force
             });
 
             rollbackActions.push(...providerRollback);

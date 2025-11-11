@@ -304,19 +304,34 @@ export async function setupServiceAccountAndSecrets(options: {
 
   const envUpper = environment.toUpperCase();
   const timestamp = new Date().toISOString().replace(/[-:T.]/g, '').substring(0, 14);
-  const serviceAccountName = `${projectName}-sa-${environment}-v${timestamp}`;
+  const serviceAccountName = `${projectName}-sa-${environment}-github-v${timestamp}`;
+
+  // Check if CapRover service account exists (informational only)
+  try {
+    const { ensureOpAuth, opGetItem, opItemField } = await import('./op-util.js');
+    ensureOpAuth();
+    const caproverItem = opGetItem(vaultName, 'CapRover');
+    if (caproverItem) {
+      const caproverServiceAccount = opItemField(caproverItem, 'ServiceAccount.service_account_name');
+      if (caproverServiceAccount && verbose) {
+        console.log(`  ℹ CapRover service account already exists: ${caproverServiceAccount}`);
+        console.log(`  Creating separate service account for GitHub Actions...`);
+      }
+    }
+  } catch {
+    // No CapRover service account exists yet, that's fine
+  }
 
   try {
-    // 1. Create service account
+    // 1. Create service account for GitHub Actions
     if (verbose) {
-      console.log(`  Creating service account for ${environment} environment...`);
+      console.log(`  Creating service account for ${environment} GitHub Actions...`);
     }
 
     const serviceAccount = await createServiceAccount({
       name: serviceAccountName,
       vault: vaultName,
       permissions: ['read_items'],
-      expiresIn: '90d', // Auto-expire after 90 days
       verbose
     });
 
@@ -352,17 +367,41 @@ export async function setupServiceAccountAndSecrets(options: {
     if (options.caprover) {
       try {
         const { updateCapRoverEnvVars } = await import('./caprover-provision.js');
+        const { opReadField } = await import('./op-util.js');
 
         if (verbose) {
           console.log(`  Updating CapRover app environment variables...`);
         }
 
+        // Build env vars array starting with service account credentials
+        const envVars: Array<{ key: string; value: string }> = [
+          { key: 'OP_SERVICE_ACCOUNT_TOKEN', value: serviceAccount.token },
+          { key: 'OP_VAULT', value: vaultName }
+        ];
+
+        // Try to add GitHub credentials if they exist in the vault
+        try {
+          const githubPat = opReadField(vaultName, 'GitHub', 'Credentials', 'pat');
+          const githubUsername = opReadField(vaultName, 'GitHub', 'Registry', 'username');
+
+          if (githubPat && githubUsername) {
+            envVars.push(
+              { key: 'GITHUB_PAT', value: githubPat },
+              { key: 'GITHUB_USERNAME', value: githubUsername }
+            );
+            if (verbose) {
+              console.log(`  Including GitHub credentials in CapRover update`);
+            }
+          }
+        } catch (e: any) {
+          if (verbose) {
+            console.log(`  Note: GitHub credentials not found in vault, skipping`);
+          }
+        }
+
         await updateCapRoverEnvVars(
           options.caprover.appName,
-          [
-            { key: 'OP_SERVICE_ACCOUNT_TOKEN', value: serviceAccount.token },
-            { key: 'OP_VAULT', value: vaultName }
-          ],
+          envVars,
           {
             url: options.caprover.url,
             password: options.caprover.password,
@@ -379,6 +418,8 @@ export async function setupServiceAccountAndSecrets(options: {
         console.warn(`  You can manually set these in CapRover:`);
         console.warn(`    - OP_SERVICE_ACCOUNT_TOKEN`);
         console.warn(`    - OP_VAULT=${vaultName}`);
+        console.warn(`    - GITHUB_PAT (if available)`);
+        console.warn(`    - GITHUB_USERNAME (if available)`);
       }
     }
 

@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupServiceAccountAndSecrets, getGitHubOwner } from './service-account.js';
 import { RollbackAction } from './rollback.js';
+import { ensureOpAuth, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -83,6 +84,82 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
 
+/**
+ * Create GitHub item in 1Password vault with PAT and username
+ */
+export async function createGitHubVaultItem(vaultName: string, verbose?: boolean): Promise<void> {
+  try {
+    ensureOpAuth();
+    opEnsureVault(vaultName);
+
+    // Get GitHub credentials - try wasp-primary vault first, then fall back to gh CLI
+    let pat: string | undefined;
+    let username: string | undefined;
+
+    // First, try to read from wasp-primary vault
+    try {
+      pat = execSync('op read "op://wasp-primary/GitHub/Credentials/pat"', {
+        stdio: 'pipe',
+        encoding: 'utf-8'
+      }).trim();
+
+      username = execSync('op read "op://wasp-primary/GitHub/Registry/username"', {
+        stdio: 'pipe',
+        encoding: 'utf-8'
+      }).trim();
+
+      if (verbose && pat && username) {
+        console.log(`  Using GitHub credentials from wasp-primary vault`);
+      }
+    } catch (e: any) {
+      // Fall back to gh CLI if wasp-primary vault doesn't have the credentials
+      if (verbose) {
+        console.log(`  wasp-primary vault not found, trying gh CLI...`);
+      }
+
+      try {
+        pat = execSync('gh auth token', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+      } catch (e: any) {
+        throw new Error(`Failed to get GitHub PAT: ${e?.message || e}. Make sure you're logged in with 'gh auth login' or have credentials in wasp-primary vault`);
+      }
+
+      try {
+        username = execSync('gh api user -q .login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+      } catch (e: any) {
+        throw new Error(`Failed to get GitHub username: ${e?.message || e}`);
+      }
+    }
+
+    if (!pat || !username) {
+      throw new Error('GitHub PAT or username is empty');
+    }
+
+    // Create GitHub item with sections
+    const githubSections: ItemSection[] = [
+      {
+        label: 'Credentials',
+        fields: [
+          { label: 'pat', value: pat, type: 'CONCEALED' }
+        ]
+      },
+      {
+        label: 'Registry',
+        fields: [
+          { label: 'username', value: username, type: 'STRING' }
+        ]
+      }
+    ];
+
+    opEnsureItemWithSections(vaultName, 'GitHub', githubSections, undefined, verbose);
+
+    if (verbose) {
+      console.log(`  ✓ Created GitHub item in vault: ${vaultName}`);
+    }
+  } catch (e: any) {
+    throw new Error(`Failed to create GitHub 1Password item: ${e?.message || e}`);
+  }
+}
+
 export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
   const { projectName, environments, verbose, force = false, updateCapRover = false } = options;
   const rollbackActions: RollbackAction[] = [];
@@ -119,6 +196,15 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
   for (const env of environments) {
     const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
     const appName = updateCapRover ? `${projectName}-api-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-') : undefined;
+
+    // Create GitHub item in vault with PAT and username
+    try {
+      await createGitHubVaultItem(vaultName, verbose);
+    } catch (e: any) {
+      // Warn but don't fail - the service account setup can still proceed
+      console.warn(`  Warning: Failed to create GitHub item in ${vaultName}: ${e?.message || e}`);
+      console.warn(`  You may need to manually add GitHub PAT and username to the vault`);
+    }
 
     try {
       const { rollbackActions: envRollback, skipped } = await setupServiceAccountAndSecrets({
