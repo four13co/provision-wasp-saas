@@ -79,6 +79,10 @@ function getOpReferencePath(vaultName: string, envVar: string): string {
     'RESEND_API_KEY': `op://${vaultName}/Resend/Credentials/api_key`,
     'RESEND_API_KEY_ID': `op://${vaultName}/Resend/Credentials/api_key_id`,
     'EMAIL_FROM': `op://${vaultName}/Resend/Configuration/email_from`,
+
+    // GitHub
+    'GITHUB_PAT': `op://${vaultName}/GitHub/Credentials/pat`,
+    'GITHUB_USERNAME': `op://${vaultName}/GitHub/Registry/username`,
   };
 
   return pathMap[envVar] || '';
@@ -118,6 +122,8 @@ function getVaultEnv(vaultName: string): NodeJS.ProcessEnv {
       'RESEND_API_KEY',
       'RESEND_API_KEY_ID',
       'EMAIL_FROM',
+      'GITHUB_PAT',
+      'GITHUB_USERNAME',
     ];
 
     // Write 1Password reference paths instead of actual values

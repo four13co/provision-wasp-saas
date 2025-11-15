@@ -104,6 +104,41 @@ export function opEnsureItemWithSections(
       console.log(`  Updating existing item: ${itemTitle}`);
     }
 
+    // ENHANCEMENT: Check which sections exist
+    const existingSections = new Set(
+      (existingItem.sections || []).map((s: any) => s.label.toLowerCase())
+    );
+
+    // Check if any required sections are missing
+    const missingSections = sections.filter(
+      section => !existingSections.has(section.label.toLowerCase())
+    );
+
+    if (missingSections.length > 0) {
+      // Some sections don't exist - recreate item to ensure proper structure
+      if (verbose) {
+        console.log(`  Section(s) missing: ${missingSections.map(s => s.label).join(', ')}`);
+        console.log(`  Recreating item with complete structure...`);
+      }
+
+      // Delete existing item
+      try {
+        execSync(
+          `op item delete --vault ${JSON.stringify(vault)} ${JSON.stringify(itemTitle)}`,
+          { stdio: 'pipe' }
+        );
+        if (verbose) {
+          console.log(`  Deleted existing item to recreate with new sections`);
+        }
+      } catch (e) {
+        // Item may not exist or already deleted, that's okay
+      }
+
+      // Recursively call to create fresh item
+      return opEnsureItemWithSections(vault, itemTitle, sections, category, verbose);
+    }
+
+    // All sections exist - update fields
     for (const section of sections) {
       for (const field of section.fields) {
         opSetField(vault, itemTitle, section.label, field.label, field.value, field.type, verbose);
@@ -186,17 +221,53 @@ export function opSetField(
 ): void {
   try {
     // Try to edit existing field
+    // Use stderr: 'inherit' to show errors while keeping stdout quiet
     execSync(
       `op item edit --vault ${JSON.stringify(vault)} ${JSON.stringify(itemTitle)} "${sectionLabel}.${fieldLabel}=${value}"`,
-      { stdio: verbose ? 'inherit' : 'ignore' }
+      { stdio: ['inherit', 'pipe', 'inherit'] }  // stdin, stdout, stderr
     );
+    if (verbose) {
+      console.log(`    Updated ${sectionLabel}.${fieldLabel}`);
+    }
   } catch (e) {
-    // Field doesn't exist - create it
-    const type = fieldType || 'STRING';
-    execSync(
-      `op item edit --vault ${JSON.stringify(vault)} ${JSON.stringify(itemTitle)} --section ${JSON.stringify(sectionLabel)} "${fieldLabel}[${type}]=${value}"`,
-      { stdio: verbose ? 'inherit' : 'ignore' }
+    // Field doesn't exist - try creating it
+    try {
+      const type = fieldType || 'STRING';
+
+      if (verbose) {
+        console.log(`    Field ${sectionLabel}.${fieldLabel} doesn't exist, creating...`);
+      }
+
+      execSync(
+        `op item edit --vault ${JSON.stringify(vault)} ${JSON.stringify(itemTitle)} --section ${JSON.stringify(sectionLabel)} "${fieldLabel}[${type}]=${value}"`,
+        { stdio: ['inherit', 'pipe', 'inherit'] }
+      );
+
+      if (verbose) {
+        console.log(`    Created ${sectionLabel}.${fieldLabel}`);
+      }
+    } catch (createError: any) {
+      // CRITICAL: Throw error instead of silent failure
+      const errorMsg = createError.stderr?.toString() || createError.message || String(createError);
+      throw new Error(
+        `Failed to set field '${sectionLabel}.${fieldLabel}' in item '${itemTitle}': ${errorMsg}\n` +
+        `This may indicate the section '${sectionLabel}' doesn't exist. ` +
+        `Try re-running with --force to recreate the item.`
+      );
+    }
+  }
+
+  // CRITICAL: Verify the field was actually saved
+  const savedValue = opReadField(vault, itemTitle, sectionLabel, fieldLabel);
+  if (!savedValue) {
+    throw new Error(
+      `Field '${sectionLabel}.${fieldLabel}' was set but verification failed. ` +
+      `The field may not have been saved correctly.`
     );
+  }
+
+  if (verbose) {
+    console.log(`    ✓ Verified ${sectionLabel}.${fieldLabel} was saved`);
   }
 }
 

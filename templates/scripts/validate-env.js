@@ -1,45 +1,40 @@
 #!/usr/bin/env node
 
 /**
- * Validate that required environment variables are present before deployment
+ * Validate that required CI/CD environment variables are present before deployment
  * This prevents cryptic deployment failures due to missing configuration
+ *
+ * Note: Application runtime secrets (DATABASE_URL, JWT_SECRET, etc.) are loaded
+ * at server startup via serverSetup.ts and don't need to be validated here.
  */
 
-// Required server environment variables (critical for deployment)
-const REQUIRED_SERVER_VARS = [
-  'DATABASE_URL',
-  'JWT_SECRET',
-  'API_URL',
-  'APP_URL'
-];
-
-// Optional but recommended server environment variables
-const OPTIONAL_SERVER_VARS = [
-  'STRIPE_API_KEY',
-  'STRIPE_WEBHOOK_SECRET',
-  'SENDGRID_API_KEY',
-  'RESEND_API_KEY',
-  'AWS_S3_IAM_ACCESS_KEY',
-  'AWS_S3_IAM_SECRET_KEY',
-  'AWS_S3_FILES_BUCKET',
-  'GOOGLE_CLIENT_ID',
-  'GOOGLE_CLIENT_SECRET',
+// Required CI/CD variables (critical for deployment)
+const REQUIRED_CICD_VARS = [
   'CAPROVER_URL',
   'CAPROVER_APP_TOKEN',
   'VERCEL_TOKEN',
   'VERCEL_PROJECT_ID',
-  'VERCEL_ORG_ID'
+  'VERCEL_ORG_ID',
+  'API_URL',
+  'APP_URL',
+  'DATABASE_URL' // Needed for migrations during deployment
+];
+
+// Optional CI/CD variables
+const OPTIONAL_CICD_VARS = [
+  'GITHUB_PAT',
+  'GITHUB_USERNAME'
 ];
 
 function validateEnvironment() {
-  console.log('🔍 Validating environment variables...\n');
+  console.log('🔍 Validating CI/CD environment variables...\n');
 
   const missing = [];
   const present = [];
   const warnings = [];
 
-  // Check required variables
-  for (const varName of REQUIRED_SERVER_VARS) {
+  // Check required CI/CD variables
+  for (const varName of REQUIRED_CICD_VARS) {
     const value = process.env[varName];
     if (!value || value.trim() === '') {
       missing.push(varName);
@@ -48,8 +43,8 @@ function validateEnvironment() {
     }
   }
 
-  // Check optional variables
-  for (const varName of OPTIONAL_SERVER_VARS) {
+  // Check optional CI/CD variables
+  for (const varName of OPTIONAL_CICD_VARS) {
     const value = process.env[varName];
     if (!value || value.trim() === '') {
       warnings.push(varName);

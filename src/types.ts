@@ -10,6 +10,7 @@ export interface ProvisionOptions {
   envSuffix: 'dev' | 'prod';
   verbose?: boolean;
   dryRun?: boolean;
+  force?: boolean;
 }
 
 /**

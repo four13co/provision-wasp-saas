@@ -136,7 +136,8 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
               projectName,
               envSuffix: env,
               verbose,
-              dryRun
+              dryRun,
+              force
             });
 
             rollbackActions.push(...providerRollback);
@@ -171,11 +172,15 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
         try {
           await createGitHubRepo({ projectName, verbose });
 
+          // Check if CapRover was provisioned so we can update env vars
+          const caproverProvisioned = componentsToProvision.includes('caprover');
+
           const { rollbackActions: githubRollback } = await setupGitHubSecrets({
             projectName,
             environments,
             verbose,
-            force
+            force,
+            updateCapRover: caproverProvisioned
           });
           rollbackActions.push(...githubRollback);
 

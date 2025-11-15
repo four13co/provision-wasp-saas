@@ -270,11 +270,12 @@ export async function listVercelInstances(
 ): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
   const { projectName, envSuffix, filterPattern, verbose } = options;
 
-  // Get Vercel token
-  const token = process.env.VERCEL_TOKEN;
+  // Get Vercel credentials using the credential system
+  const credentials = getVercelCredentials();
+  const token = credentials.token;
 
   if (!token) {
-    throw new Error('VERCEL_TOKEN not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('vercel') + '\nSpecifically missing: VERCEL_TOKEN');
   }
 
   try {
@@ -351,19 +352,15 @@ export async function deleteVercelInstance(
 ): Promise<{ id: string; name: string; success: boolean; error?: string }> {
   const { verbose } = options;
 
-  // Get Vercel token
-  const token = process.env.VERCEL_TOKEN;
-
-  if (!token) {
-    return {
-      id: instanceId,
-      name: instanceId,
-      success: false,
-      error: 'VERCEL_TOKEN not set. Add to .env file'
-    };
-  }
-
   try {
+    // Get Vercel credentials using the credential system
+    const credentials = getVercelCredentials();
+    const token = credentials.token;
+
+    if (!token) {
+      throw new Error(getMissingCredentialsMessage('vercel'));
+    }
+
     await retryFetch(
       `https://api.vercel.com/v9/projects/${instanceId}`,
       {
