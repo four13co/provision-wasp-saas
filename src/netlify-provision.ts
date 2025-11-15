@@ -242,11 +242,12 @@ export async function listNetlifyInstances(
 ): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
   const { projectName, envSuffix, filterPattern, verbose } = options;
 
-  // Get Netlify token
-  const token = process.env.NETLIFY_TOKEN;
+  // Get Netlify credentials using the credential system
+  const credentials = getNetlifyCredentials();
+  const token = credentials.token;
 
   if (!token) {
-    throw new Error('NETLIFY_TOKEN not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('netlify') + '\nSpecifically missing: NETLIFY_TOKEN');
   }
 
   try {
@@ -323,19 +324,15 @@ export async function deleteNetlifyInstance(
 ): Promise<{ id: string; name: string; success: boolean; error?: string }> {
   const { verbose } = options;
 
-  // Get Netlify token
-  const token = process.env.NETLIFY_TOKEN;
-
-  if (!token) {
-    return {
-      id: instanceId,
-      name: instanceId,
-      success: false,
-      error: 'NETLIFY_TOKEN not set. Add to .env file'
-    };
-  }
-
   try {
+    // Get Netlify credentials using the credential system
+    const credentials = getNetlifyCredentials();
+    const token = credentials.token;
+
+    if (!token) {
+      throw new Error(getMissingCredentialsMessage('netlify'));
+    }
+
     await retryFetch(
       `https://api.netlify.com/api/v1/sites/${instanceId}`,
       {

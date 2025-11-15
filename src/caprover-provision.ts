@@ -25,6 +25,50 @@ function apiBase(u: string) {
 }
 
 /**
+ * Resilient fetch wrapper for CapRover API calls
+ * Handles EPIPE errors (broken pipe) caused by connection reuse issues
+ * Automatically retries with exponential backoff and prevents connection pooling
+ */
+async function capRoverFetch(
+  url: string,
+  options: RequestInit = {},
+  retries = 3,
+  verbose = false
+): Promise<Response> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fetch(url, {
+        ...options,
+        headers: {
+          ...(options.headers || {}),
+          'Connection': 'close' // Prevent connection reuse that causes EPIPE
+        }
+      });
+    } catch (error: any) {
+      // Check for EPIPE error (broken pipe)
+      const isEPIPE = error?.cause?.code === 'EPIPE' ||
+                       error?.code === 'EPIPE' ||
+                       error?.message?.includes('EPIPE');
+
+      if (isEPIPE && attempt < retries - 1) {
+        const delayMs = 1000 * (attempt + 1); // Exponential backoff: 1s, 2s, 3s
+        if (verbose) {
+          console.log(`  ⚠️  Connection error (EPIPE), retrying in ${delayMs/1000}s... (attempt ${attempt + 1}/${retries})`);
+        }
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        continue; // Retry
+      }
+
+      // Not EPIPE or out of retries - propagate error
+      throw error;
+    }
+  }
+
+  // TypeScript needs this but it's unreachable
+  throw new Error('Unreachable: capRoverFetch exhausted retries without throwing');
+}
+
+/**
  * Provision a CapRover backend application
  */
 export async function provisionCapRover(
@@ -70,32 +114,76 @@ export async function provisionCapRover(
   let apiUrl = '';
 
   try {
+    // Debug logging for connection attempt
+    if (verbose) {
+      console.log(`  Attempting to connect to CapRover:`);
+      console.log(`    URL: ${url}`);
+      console.log(`    API Base: ${base}`);
+      console.log(`    Password: ${password ? '***SET***' : '***NOT SET***'}`);
+    }
+
     // Login to CapRover API
-    let res = await fetch(`${base}/login`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
-      body: new URLSearchParams({ password })
-    });
+    let res: Response;
+    try {
+      res = await capRoverFetch(`${base}/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
+        body: new URLSearchParams({ password })
+      }, 3, verbose);
+    } catch (fetchError: any) {
+      // Capture detailed error information
+      const errorDetails = {
+        message: fetchError.message || 'Unknown error',
+        code: fetchError.code || 'NO_CODE',
+        cause: fetchError.cause ? String(fetchError.cause) : 'NO_CAUSE',
+        type: fetchError.constructor?.name || 'Unknown',
+        errno: fetchError.errno,
+        syscall: fetchError.syscall
+      };
+
+      console.error(`\n❌ CapRover Connection Failed - Detailed Error:`);
+      console.error(`  Message: ${errorDetails.message}`);
+      console.error(`  Error Code: ${errorDetails.code}`);
+      console.error(`  Error Type: ${errorDetails.type}`);
+      if (errorDetails.cause !== 'NO_CAUSE') {
+        console.error(`  Cause: ${errorDetails.cause}`);
+      }
+      if (errorDetails.errno) {
+        console.error(`  Errno: ${errorDetails.errno}`);
+      }
+      if (errorDetails.syscall) {
+        console.error(`  Syscall: ${errorDetails.syscall}`);
+      }
+      console.error(`  Target URL: ${base}/login`);
+      console.error(`  Full URL: ${url}\n`);
+
+      if (verbose && fetchError.stack) {
+        console.error(`  Stack trace:\n${fetchError.stack}`);
+      }
+
+      throw new Error(`Failed to connect to CapRover at ${url}: [${errorDetails.code}] ${errorDetails.message}. Please check that the server is accessible and the URL is correct.`);
+    }
 
     const login = await res.json().catch(() => ({} as any)) as any;
     const token = login?.data?.token;
 
     if (!token) {
-      throw new Error('Failed to authenticate with CapRover API');
+      throw new Error(`Failed to authenticate with CapRover API at ${url}. Status: ${res.status}. Please verify CAPROVER_PASSWORD is correct.`);
     }
 
     // Check if app already exists
-    const defsRes = await fetch(`${base}/user/apps/appDefinitions/`, {
+    const defsRes = await capRoverFetch(`${base}/user/apps/appDefinitions/`, {
       headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-    });
+    }, 3, verbose);
 
     const defsJson = defsRes.ok ? await defsRes.json().catch(() => null) : null as any;
     const existingApps = defsJson?.data?.appDefinitions || [];
     const existingApp = existingApps.find((a: any) => (a?.appName || '').toLowerCase() === appName.toLowerCase());
 
     if (existingApp) {
-      // App already exists - retrieve its details
-      appToken = existingApp?.appDeployTokenConfig?.appDeployToken || '';
+      // App already exists - check its current deploy token status
+      const hasToken = !!(existingApp?.appDeployTokenConfig?.appDeployToken);
+      const tokenEnabled = existingApp?.appDeployTokenConfig?.enabled === true;
 
       try {
         const u = new URL(url);
@@ -109,9 +197,15 @@ export async function provisionCapRover(
 
       if (verbose) {
         console.log(`  ✓ CapRover app already exists: ${appName}`);
+        if (hasToken && tokenEnabled) {
+          console.log(`  ✓ App deploy token already enabled`);
+          appToken = existingApp.appDeployTokenConfig.appDeployToken;
+        } else if (!tokenEnabled) {
+          console.log(`  ⚠️  App deploy token not enabled - will attempt to enable it`);
+        }
       }
 
-      // Skip to vault writing and service account setup
+      // Continue to token enabling logic below (don't skip)
     } else {
     // Register app with retry logic for 429 "operation in progress" errors
     const maxRetries = 3;
@@ -119,19 +213,19 @@ export async function provisionCapRover(
 
     for (let attempt = 0; attempt < maxRetries && !registrationSuccess; attempt++) {
       try {
-        res = await fetch(`${base}/user/apps/appDefinitions/register/`, {
+        res = await capRoverFetch(`${base}/user/apps/appDefinitions/register/`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
           body: JSON.stringify({ appName })
-        });
+        }, 3, verbose);
 
         if (!res.ok) {
           // Try alternative path variant
-          res = await fetch(`${base}/user/apps/appDefinitions/register`, {
+          res = await capRoverFetch(`${base}/user/apps/appDefinitions/register`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
             body: JSON.stringify({ appName })
-          });
+          }, 3, verbose);
         }
 
         if (!res.ok) {
@@ -194,11 +288,11 @@ export async function provisionCapRover(
       for (const p of candidates) {
         for (const suffix of ['/', '']) {
           const path = `${p}${suffix}`;
-          const r = await fetch(`${base}${path}`, {
+          const r = await capRoverFetch(`${base}${path}`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
             body: JSON.stringify({ appName })
-          });
+          }, 3, verbose);
 
           const txt = await r.text().catch(() => '');
 
@@ -229,68 +323,7 @@ export async function provisionCapRover(
       console.warn(`  Warning: Could not enable HTTPS: ${e?.message || e}`);
     }
 
-    // Enable app deploy token via update endpoint
-    try {
-      const defs1 = await fetch(`${base}/user/apps/appDefinitions/`, {
-        headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-      });
-
-      const defsJson1 = defs1.ok ? await defs1.json().catch(() => null) : null as any;
-      const list = defsJson1?.data?.appDefinitions || [];
-      const current = list.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
-
-      if (current) {
-        const body: any = {
-          appName,
-          projectId: current.projectId || '',
-          description: current.description || '',
-          instanceCount: current.instanceCount ?? 1,
-          captainDefinitionRelativeFilePath: current.captainDefinitionRelativeFilePath || 'captain-definition',
-          envVars: current.envVars || [],
-          volumes: current.volumes || [],
-          tags: current.tags || [],
-          nodeId: current.nodeId || '',
-          notExposeAsWebApp: !!current.notExposeAsWebApp,
-          containerHttpPort: current.containerHttpPort || 80,
-          httpAuth: current.httpAuth || undefined,
-          forceSsl: !!current.forceSsl,
-          ports: current.ports || [],
-          appPushWebhook: current.appPushWebhook ? { repoInfo: current.appPushWebhook.repoInfo || {} } : undefined,
-          customNginxConfig: current.customNginxConfig || '',
-          redirectDomain: current.redirectDomain || '',
-          preDeployFunction: current.preDeployFunction || '',
-          serviceUpdateOverride: current.serviceUpdateOverride || '',
-          websocketSupport: !!current.websocketSupport,
-          appDeployTokenConfig: { enabled: true }
-        };
-
-        await fetch(`${base}/user/apps/appDefinitions/update/`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
-          body: JSON.stringify(body)
-        });
-      }
-
-      // Fetch updated definitions to get the token
-      const defs2 = await fetch(`${base}/user/apps/appDefinitions/`, {
-        headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-      });
-
-      const defsJson2 = defs2.ok ? await defs2.json().catch(() => null) : null as any;
-      const list2 = defsJson2?.data?.appDefinitions || [];
-      const after = list2.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
-      appToken = after?.appDeployTokenConfig?.appDeployToken || '';
-
-      if (appToken && verbose) {
-        console.log(`  ✓ Generated app deploy token`);
-      }
-    } catch (e: any) {
-      if (verbose) {
-        console.warn(`  Warning: Could not generate app token: ${e?.message || e}`);
-      }
-    }
-
-    // Compute API URL
+    // Compute API URL for new apps
     try {
       const u = new URL(url);
       const host = u.hostname.replace(/^captain\./, '');
@@ -308,11 +341,11 @@ export async function provisionCapRover(
           `Delete CapRover app ${appName}`,
           async () => {
             try {
-              await fetch(`${base}/user/apps/appDefinitions/delete/`, {
+              await capRoverFetch(`${base}/user/apps/appDefinitions/delete/`, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
                 body: JSON.stringify({ appName })
-              });
+              }, 3, verbose);
               if (verbose) {
                 console.log(`    Deleted CapRover app ${appName}`);
               }
@@ -323,6 +356,73 @@ export async function provisionCapRover(
         )
       );
     } // End of "else" block for new app creation
+
+    // Enable app deploy token for both new and existing apps (if not already enabled)
+    if (!appToken || existingApp?.appDeployTokenConfig?.enabled !== true) {
+      try {
+        const defs1 = await capRoverFetch(`${base}/user/apps/appDefinitions/`, {
+          headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+        }, 3, verbose);
+
+        const defsJson1 = defs1.ok ? await defs1.json().catch(() => null) : null as any;
+        const list = defsJson1?.data?.appDefinitions || [];
+        const current = list.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
+
+        if (current) {
+          const body: any = {
+            appName,
+            projectId: current.projectId || '',
+            description: current.description || '',
+            instanceCount: current.instanceCount ?? 1,
+            captainDefinitionRelativeFilePath: current.captainDefinitionRelativeFilePath || 'captain-definition',
+            envVars: current.envVars || [],
+            volumes: current.volumes || [],
+            tags: current.tags || [],
+            nodeId: current.nodeId || '',
+            notExposeAsWebApp: !!current.notExposeAsWebApp,
+            containerHttpPort: current.containerHttpPort || 80,
+            httpAuth: current.httpAuth || undefined,
+            forceSsl: !!current.forceSsl,
+            ports: current.ports || [],
+            appPushWebhook: current.appPushWebhook ? { repoInfo: current.appPushWebhook.repoInfo || {} } : undefined,
+            customNginxConfig: current.customNginxConfig || '',
+            redirectDomain: current.redirectDomain || '',
+            preDeployFunction: current.preDeployFunction || '',
+            serviceUpdateOverride: current.serviceUpdateOverride || '',
+            websocketSupport: !!current.websocketSupport,
+            appDeployTokenConfig: { enabled: true }
+          };
+
+          await capRoverFetch(`${base}/user/apps/appDefinitions/update/`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
+            body: JSON.stringify(body)
+          }, 3, verbose);
+
+          if (verbose) {
+            console.log(`  ✓ Enabled app deploy token`);
+          }
+        }
+
+        // Fetch updated definitions to get the token
+        const defs2 = await capRoverFetch(`${base}/user/apps/appDefinitions/`, {
+          headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
+        }, 3, verbose);
+
+        const defsJson2 = defs2.ok ? await defs2.json().catch(() => null) : null as any;
+        const list2 = defsJson2?.data?.appDefinitions || [];
+        const after = list2.find((d: any) => (d?.appName || '').toLowerCase() === appName.toLowerCase());
+        appToken = after?.appDeployTokenConfig?.appDeployToken || '';
+
+        if (appToken && verbose) {
+          console.log(`  ✓ Retrieved app deploy token`);
+        }
+      } catch (e: any) {
+        if (verbose) {
+          console.warn(`  Warning: Could not enable/retrieve app token: ${e?.message || e}`);
+        }
+      }
+    }
 
     // Create service account and set CapRover environment variables
     let serviceAccountToken = '';
@@ -349,8 +449,10 @@ export async function provisionCapRover(
             console.log(`  ✓ Retrieved service account token from vault`);
           }
         } else {
-          console.warn(`  Warning: Service account exists but token not found in vault`);
-          console.warn(`  You may need to manually set OP_SERVICE_ACCOUNT_TOKEN in CapRover`);
+          console.warn(`  ⚠️  Service account '${existingServiceAccountName}' found but token is missing`);
+          console.warn(`  To fix: Re-run with --force to recreate service account and save token:`);
+          console.warn(`    provision-wasp-saas --provision-caprover --env ${envSuffix} --force`);
+          console.warn(`  Or manually set OP_SERVICE_ACCOUNT_TOKEN in CapRover if the service account still works`);
         }
       } else {
         // Create new service account (or force recreation)
@@ -448,20 +550,20 @@ export async function provisionCapRover(
 
           const base = apiBase(verifyUrl);
 
-          // Login
-          const loginRes = await fetch(`${base}/login`, {
+          // Login for verification
+          const loginRes = await capRoverFetch(`${base}/login`, {
             method: 'POST',
             headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
             body: new URLSearchParams({ password: verifyPassword })
-          });
+          }, 3, verbose);
           const loginJson = await loginRes.json().catch(() => ({} as any)) as any;
           const token = loginJson?.data?.token;
 
           if (token) {
             // Get app definition
-            const defsRes = await fetch(`${base}/user/apps/appDefinitions/`, {
+            const defsRes = await capRoverFetch(`${base}/user/apps/appDefinitions/`, {
               headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-            });
+            }, 3, verbose);
             const defsJson = await defsRes.json().catch(() => null) as any;
             const apps = defsJson?.data?.appDefinitions || [];
             const app = apps.find((a: any) => (a?.appName || '').toLowerCase() === appName.toLowerCase());
@@ -490,9 +592,16 @@ export async function provisionCapRover(
             }
           }
         } catch (verifyError: any) {
-          // Verification failed, but env vars might still be set
+          // Verification failed, but env vars might still be set - this is non-fatal
           if (verbose) {
-            console.log(`  ✓ CapRover environment variables set (verification skipped: ${verifyError.message})`);
+            const errorDetails = {
+              message: verifyError.message || 'Unknown error',
+              code: verifyError.code || 'NO_CODE',
+              type: verifyError.constructor?.name || 'Unknown'
+            };
+            console.log(`  ✓ CapRover environment variables set (verification skipped)`);
+            console.log(`    Verification error: [${errorDetails.code}] ${errorDetails.message}`);
+            console.log(`    This is non-fatal - env vars were likely set successfully`);
           } else {
             console.log(`  ✓ CapRover environment variables set`);
           }
@@ -558,7 +667,7 @@ export async function provisionCapRover(
           { label: 'created_at', value: new Date().toISOString(), type: 'STRING' }
         ];
 
-        // Add token if we just created the service account
+        // Add token if available (either just created or retrieved from vault)
         if (serviceAccountToken) {
           serviceAccountFields.push({
             label: 'token',
@@ -578,12 +687,41 @@ export async function provisionCapRover(
       if (verbose) {
         console.log(`  ✓ Wrote CapRover details to 1Password vault: ${vaultName}`);
       }
+
+      // CRITICAL: Verify service account token was saved if it exists
+      if (serviceAccountToken) {
+        const verifyToken = opReadField(vaultName, 'CapRover', 'ServiceAccount', 'token');
+        if (!verifyToken || verifyToken !== serviceAccountToken) {
+          throw new Error(
+            `CRITICAL: Service account token was NOT saved to 1Password vault!\n` +
+            `Expected token but got: ${verifyToken ? 'different value' : 'null'}\n` +
+            `This will cause future runs to fail. Re-run with --force to recreate the item.`
+          );
+        }
+        if (verbose) {
+          console.log(`  ✓ Verified service account token saved to vault`);
+        }
+      }
     } catch (e: any) {
-      console.warn(`  Warning: Failed to write to 1Password: ${e?.message || e}`);
+      // CRITICAL: Make this a fatal error, not a warning
+      throw new Error(
+        `CRITICAL: Failed to save to 1Password vault: ${e?.message || e}\n` +
+        `CapRover app was created but integration will not work without vault storage.\n` +
+        `Please fix 1Password access and re-run with --force.`
+      );
     }
 
-    if (!appToken) {
-      console.warn(`  Warning: App token not generated. Create manually in CapRover UI and add to vault as CAPROVER_APP_TOKEN.`);
+    if (!appToken && !existingApp) {
+      // Only warn if this is a new app - existing apps may not have tokens enabled
+      console.warn(`  ⚠️  App token not generated. To enable deployment:`);
+      console.warn(`     1. Go to CapRover UI → Apps → ${appName}`);
+      console.warn(`     2. Enable "App Deploy Token" in settings`);
+      console.warn(`     3. Re-run this command to retrieve and save the token`);
+    } else if (!appToken && existingApp) {
+      // Existing app without token - provide guidance
+      if (!verbose) {
+        console.warn(`  ⚠️  App deploy token not found (enable in CapRover UI if needed)`);
+      }
     }
 
     if (verbose) {
@@ -601,7 +739,16 @@ export async function provisionCapRover(
       rollbackActions
     };
   } catch (e: any) {
-    throw new Error(`CapRover provisioning failed: ${e?.message || e}`);
+    // Provide helpful error message based on error type
+    const errorMsg = e?.message || String(e);
+
+    if (errorMsg.includes('Failed to connect to CapRover')) {
+      throw new Error(`CapRover provisioning failed: ${errorMsg}\n\nTroubleshooting:\n1. Verify the CapRover server is running and accessible\n2. Check your network connection\n3. Confirm CAPROVER_URL is correct: ${url}`);
+    } else if (errorMsg.includes('Failed to authenticate')) {
+      throw new Error(`CapRover provisioning failed: ${errorMsg}\n\nTroubleshooting:\n1. Verify CAPROVER_PASSWORD is correct\n2. Try logging into CapRover web UI with the same password`);
+    } else {
+      throw new Error(`CapRover provisioning failed: ${errorMsg}`);
+    }
   }
 }
 
@@ -613,24 +760,25 @@ export async function listCapRoverInstances(
 ): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
   const { projectName, envSuffix, filterPattern, verbose } = options;
 
-  // Get CapRover credentials
-  const url = process.env.CAPROVER_URL;
-  const password = process.env.CAPROVER_PASSWORD;
-
-  if (verbose) {
-    console.log(`  Debug: CAPROVER_URL is ${url ? 'set' : 'NOT SET'}`);
-    console.log(`  Debug: CAPROVER_PASSWORD is ${password ? 'set' : 'NOT SET'}`);
-  }
+  // Get CapRover credentials using the credential system
+  const credentials = getCapRoverCredentials();
+  const url = credentials.url;
+  const password = credentials.password;
 
   if (!url) {
-    throw new Error('CAPROVER_URL not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('caprover') + '\nSpecifically missing: CAPROVER_URL');
   }
 
   if (!password) {
-    throw new Error('CAPROVER_PASSWORD not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('caprover') + '\nSpecifically missing: CAPROVER_PASSWORD');
   }
 
-  const base = url.endsWith('/') ? url.slice(0, -1) : url;
+  if (verbose) {
+    console.log(`  Debug: CAPROVER_URL is set`);
+    console.log(`  Debug: CAPROVER_PASSWORD is set`);
+  }
+
+  const base = apiBase(url);
 
   if (verbose) {
     console.log(`  Debug: Connecting to CapRover at ${base}`);
@@ -638,11 +786,11 @@ export async function listCapRoverInstances(
 
   try {
     // Login
-    const loginResp = await fetch(`${base}/api/v2/login`, {
+    const loginResp = await capRoverFetch(`${base}/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-namespace': 'captain' },
       body: JSON.stringify({ password })
-    });
+    }, 3, verbose);
 
     if (verbose) {
       console.log(`  Debug: Login response status: ${loginResp.status}`);
@@ -664,9 +812,9 @@ export async function listCapRoverInstances(
     let appsData: any = null;
 
     // Try v2 API first
-    appsResp = await fetch(`${base}/api/v2/user/apps/appDefinitions`, {
+    appsResp = await capRoverFetch(`${base}/user/apps/appDefinitions`, {
       headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-    });
+    }, 3, verbose);
 
     if (verbose) {
       console.log(`  Debug: Apps list response status (v2): ${appsResp.status}`);
@@ -674,9 +822,9 @@ export async function listCapRoverInstances(
 
     if (!appsResp.ok) {
       // Fall back to non-versioned API
-      appsResp = await fetch(`${base}/user/apps/appDefinitions`, {
+      appsResp = await capRoverFetch(`${base}/user/apps/appDefinitions`, {
         headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-      });
+      }, 3, verbose);
 
       if (verbose) {
         console.log(`  Debug: Apps list response status (non-versioned): ${appsResp.status}`);
@@ -778,11 +926,11 @@ export async function updateCapRoverEnvVars(
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       // Login to CapRover API
-      const res = await fetch(`${base}/login`, {
+      const res = await capRoverFetch(`${base}/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-namespace': 'captain' },
         body: new URLSearchParams({ password })
-      });
+      }, 3, verbose);
 
       const login = await res.json().catch(() => ({} as any)) as any;
       const token = login?.data?.token;
@@ -792,9 +940,9 @@ export async function updateCapRoverEnvVars(
       }
 
       // Get current app definition
-      const defs = await fetch(`${base}/user/apps/appDefinitions/`, {
+      const defs = await capRoverFetch(`${base}/user/apps/appDefinitions/`, {
         headers: { 'x-namespace': 'captain', 'x-captain-auth': token }
-      });
+      }, 3, verbose);
 
       const defsJson = defs.ok ? await defs.json().catch(() => null) : null as any;
       const list = defsJson?.data?.appDefinitions || [];
@@ -849,11 +997,11 @@ export async function updateCapRoverEnvVars(
         appDeployTokenConfig: current.appDeployTokenConfig || { enabled: false }
       };
 
-      const updateRes = await fetch(`${base}/user/apps/appDefinitions/update/`, {
+      const updateRes = await capRoverFetch(`${base}/user/apps/appDefinitions/update/`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
         body: JSON.stringify(body)
-      });
+      }, 3, verbose);
 
       if (!updateRes.ok) {
         const errorText = await updateRes.text().catch(() => '');
@@ -897,37 +1045,24 @@ export async function deleteCapRoverInstance(
 ): Promise<{ id: string; name: string; success: boolean; error?: string }> {
   const { verbose } = options;
 
-  // Get CapRover credentials
-  const url = process.env.CAPROVER_URL;
-  const password = process.env.CAPROVER_PASSWORD;
-
-  if (!url) {
-    return {
-      id: instanceId,
-      name: instanceId,
-      success: false,
-      error: 'CAPROVER_URL not set. Add to .env file'
-    };
-  }
-
-  if (!password) {
-    return {
-      id: instanceId,
-      name: instanceId,
-      success: false,
-      error: 'CAPROVER_PASSWORD not set. Add to .env file'
-    };
-  }
-
-  const base = url.endsWith('/') ? url.slice(0, -1) : url;
-
   try {
+    // Get CapRover credentials using the credential system
+    const credentials = getCapRoverCredentials();
+    const url = credentials.url;
+    const password = credentials.password;
+
+    if (!url || !password) {
+      throw new Error(getMissingCredentialsMessage('caprover'));
+    }
+
+    const base = apiBase(url);
+
     // Login
-    const loginResp = await fetch(`${base}/api/v2/login`, {
+    const loginResp = await capRoverFetch(`${base}/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-namespace': 'captain' },
       body: JSON.stringify({ password })
-    });
+    }, 3, verbose);
 
     const loginData: any = loginResp.ok ? await loginResp.json() : null;
     const token = loginData?.data?.token;
@@ -942,11 +1077,11 @@ export async function deleteCapRoverInstance(
     }
 
     // Delete app
-    const deleteResp = await fetch(`${base}/user/apps/appDefinitions/delete`, {
+    const deleteResp = await capRoverFetch(`${base}/user/apps/appDefinitions/delete/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-namespace': 'captain', 'x-captain-auth': token },
       body: JSON.stringify({ appName: instanceId })
-    });
+    }, 3, verbose);
 
     if (!deleteResp.ok) {
       const errorData: any = await deleteResp.json().catch(() => ({}));

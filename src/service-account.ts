@@ -27,8 +27,60 @@ export interface GitHubSecretOptions {
 }
 
 /**
+ * Print instructions for manually creating a service account
+ */
+function printManualServiceAccountInstructions(name: string, vault: string, permissions: string[]): void {
+  const permissionStr = permissions.join(',');
+
+  console.log('');
+  console.log('━'.repeat(80));
+  console.log('⚠️  SERVICE ACCOUNT CREATION FAILED');
+  console.log('━'.repeat(80));
+  console.log('');
+  console.log('The 1Password CLI command failed with a "Bad Request" error.');
+  console.log('This is a known issue with 1Password CLI v2.31.x.');
+  console.log('');
+  console.log('Please create the service account manually using these steps:');
+  console.log('');
+  console.log('📋 MANUAL STEPS:');
+  console.log('');
+  console.log('Step 1: Open your 1Password account in a browser');
+  console.log('        https://start.1password.com/');
+  console.log('');
+  console.log('Step 2: Navigate to service account creation');
+  console.log('        Developer → Directory → Infrastructure Secrets Management');
+  console.log('        OR: https://start.1password.com/integrations/directory');
+  console.log('');
+  console.log('Step 3: Click "Create Service Account" button');
+  console.log('');
+  console.log('Step 4: Configure the service account:');
+  console.log(`        - Name: ${name}`);
+  console.log('        - Can create vaults: NO (uncheck this box)');
+  console.log(`        - Vault access: "${vault}" with "${permissionStr}" permission`);
+  console.log('');
+  console.log('Step 5: Click "Create" and IMMEDIATELY save the token');
+  console.log('        ⚠️  The token is shown ONLY ONCE - copy it now!');
+  console.log('');
+  console.log('Step 6: Store the token in your vault:');
+  console.log(`        Vault: ${vault}`);
+  console.log('        Item: CapRover or GitHub (depending on usage)');
+  console.log('        Section: ServiceAccount');
+  console.log('        Field: token');
+  console.log('');
+  console.log('Step 7: Re-run the provisioning command');
+  console.log('');
+  console.log('📚 Documentation:');
+  console.log('   https://developer.1password.com/docs/service-accounts/get-started/');
+  console.log('');
+  console.log('━'.repeat(80));
+  console.log('');
+}
+
+/**
  * Create a 1Password service account with vault access
  * Returns the service account token (only available once!)
+ *
+ * If CLI creation fails, prints manual instructions and throws an error
  */
 export async function createServiceAccount(
   options: ServiceAccountOptions
@@ -40,8 +92,8 @@ export async function createServiceAccount(
     const permissionStr = permissions.join(',');
     const vaultAccess = `${vault}:${permissionStr}`;
 
-    // Build command
-    let cmd = `op service-account create "${name}" --vault "${vaultAccess}" --raw`;
+    // Build command - format is: op service-account create <name> --vault <vault>:<perms>
+    let cmd = `op service-account create "${name}" --vault "${vaultAccess}"`;
 
     if (expiresIn) {
       cmd += ` --expires-in "${expiresIn}"`;
@@ -53,13 +105,25 @@ export async function createServiceAccount(
     }
 
     // Execute command and capture token
-    const token = execSync(cmd, {
+    const output = execSync(cmd, {
       stdio: 'pipe',
       encoding: 'utf-8'
     }).trim();
 
+    // Parse token from output - CLI returns multiple lines:
+    // "Service account created successfully!"
+    // "Service account UUID: ..."
+    // "Service account token:"
+    // "ops_..."
+    // Extract the line that starts with "ops_"
+    const lines = output.split('\n');
+    const tokenLine = lines.find(line => line.trim().startsWith('ops_'));
+    const token = tokenLine?.trim();
+
     if (!token || !token.startsWith('ops_')) {
-      throw new Error(`Invalid service account token received: ${token.substring(0, 10)}...`);
+      throw new Error(
+        `Invalid service account token received. Expected token starting with 'ops_', got:\n${output.substring(0, 200)}...`
+      );
     }
 
     if (verbose) {
@@ -72,7 +136,27 @@ export async function createServiceAccount(
       token
     };
   } catch (error: any) {
-    throw new Error(`Failed to create service account '${name}': ${error.message}`);
+    const errorMsg = error.message || String(error);
+    const stderr = error.stderr?.toString() || '';
+
+    // Check for the specific "Bad Request" error from 1Password CLI
+    if (errorMsg.includes('Bad Request') || stderr.includes('Bad Request') ||
+        errorMsg.includes('structure of request was invalid') ||
+        stderr.includes('structure of request was invalid')) {
+
+      // Print detailed manual instructions
+      printManualServiceAccountInstructions(name, vault, permissions);
+
+      // Throw error with helpful message
+      throw new Error(
+        `1Password CLI service account creation failed. ` +
+        `Please create the service account manually using the steps printed above. ` +
+        `This is a known issue with 1Password CLI v2.31.x.`
+      );
+    }
+
+    // For other errors, throw with original message
+    throw new Error(`Failed to create service account '${name}': ${errorMsg}`);
   }
 }
 

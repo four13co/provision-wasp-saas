@@ -192,11 +192,12 @@ export async function listResendInstances(
 ): Promise<Array<{ id: string; name: string; environment?: 'dev' | 'prod' | 'unknown'; metadata?: any; createdAt?: string }>> {
   const { projectName, envSuffix, filterPattern, verbose } = options;
 
-  // Get Resend API key
-  const apiKey = process.env.RESEND_API_KEY;
+  // Get Resend credentials using the credential system
+  const credentials = getResendCredentials();
+  const apiKey = credentials.apiKey;
 
   if (!apiKey) {
-    throw new Error('RESEND_API_KEY not set. Add to .env file');
+    throw new Error(getMissingCredentialsMessage('resend') + '\nSpecifically missing: RESEND_API_KEY');
   }
 
   try {
@@ -272,19 +273,15 @@ export async function deleteResendInstance(
 ): Promise<{ id: string; name: string; success: boolean; error?: string }> {
   const { verbose } = options;
 
-  // Get Resend API key
-  const apiKey = process.env.RESEND_API_KEY;
-
-  if (!apiKey) {
-    return {
-      id: instanceId,
-      name: instanceId,
-      success: false,
-      error: 'RESEND_API_KEY not set. Add to .env file'
-    };
-  }
-
   try {
+    // Get Resend credentials using the credential system
+    const credentials = getResendCredentials();
+    const apiKey = credentials.apiKey;
+
+    if (!apiKey) {
+      throw new Error(getMissingCredentialsMessage('resend'));
+    }
+
     await retryFetch(
       `https://api.resend.com/api-keys/${instanceId}`,
       {

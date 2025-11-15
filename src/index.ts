@@ -17,11 +17,13 @@ import { ProviderName, cleanupRegistry } from './providers.js';
 import { cleanup } from './cleanup.js';
 import { checkConfig } from './check-config.js';
 import { initCommand } from './init-command.js';
+import { auditCommand } from './audit-command.js';
 
 interface CliArgs {
   // Tool commands
   init: boolean;
   checkConfig: boolean;
+  audit: boolean;
 
   // Full provisioning
   provision: boolean;
@@ -60,6 +62,7 @@ interface CliArgs {
   help: boolean;
   dryRun: boolean;
   force: boolean;
+  showValues: boolean;
 }
 
 function parseArgs(): CliArgs {
@@ -95,6 +98,7 @@ function parseArgs(): CliArgs {
   return {
     init: args.includes('init') || args.includes('--init'),
     checkConfig: args.includes('--check-config'),
+    audit: args.includes('--audit'),
     provision: args.includes('--provision'),
     provisionOnePassword: args.includes('--provision-onepassword') || args.includes('--provision-1password'),
     provisionNeon: args.includes('--provision-neon'),
@@ -120,7 +124,8 @@ function parseArgs(): CliArgs {
     verbose: args.includes('--verbose') || args.includes('-v'),
     help: args.includes('--help') || args.includes('-h'),
     dryRun: args.includes('--dry-run'),
-    force: args.includes('--force')
+    force: args.includes('--force'),
+    showValues: args.includes('--show-values')
   };
 }
 
@@ -140,6 +145,11 @@ USAGE:
 
 SETUP COMMANDS:
   init                           Set up infrastructure credentials in 1Password vault
+
+AUDIT COMMANDS:
+  --audit --project <name>       Audit 1Password vaults for a project (read-only)
+                                 Shows all items, sections, and fields
+  --show-values                  Show actual secret values (use with caution!)
 
 PROVISIONING OPTIONS:
   --provision                    Run full infrastructure provisioning (all components)
@@ -176,6 +186,19 @@ GENERAL OPTIONS:
   --force                        Force reprovisioning even if resources already exist
   --check-config                 Check credential configuration and show status
   --help, -h                     Show this help message
+
+AUDIT EXAMPLES:
+  # Audit both dev and prod vaults for a project
+  npx provision-wasp-saas --audit --project my-app
+
+  # Audit only production vault
+  npx provision-wasp-saas --audit --project my-app --env prod
+
+  # Show actual secret values (use with caution!)
+  npx provision-wasp-saas --audit --project my-app --show-values
+
+  # Show op:// reference paths
+  npx provision-wasp-saas --audit --project my-app --verbose
 
 PROVISIONING EXAMPLES:
   # Full provisioning (all components, both environments)
@@ -294,9 +317,23 @@ For more information:
 `);
 }
 
-function detectWaspProject(): boolean {
+function detectWaspProject(): { found: boolean; path: string } {
   const markers = ['main.wasp', '.wasproot'];
-  return markers.some(file => fs.existsSync(path.join(process.cwd(), file)));
+
+  // Check current directory first
+  const cwdHasWasp = markers.some(file => fs.existsSync(path.join(process.cwd(), file)));
+  if (cwdHasWasp) {
+    return { found: true, path: process.cwd() };
+  }
+
+  // Check ./app subdirectory (common Wasp project structure)
+  const appDir = path.join(process.cwd(), 'app');
+  const appHasWasp = markers.some(file => fs.existsSync(path.join(appDir, file)));
+  if (appHasWasp) {
+    return { found: true, path: appDir };
+  }
+
+  return { found: false, path: process.cwd() };
 }
 
 /**
@@ -374,6 +411,16 @@ async function main() {
     process.exit(0);
   }
 
+  if (args.audit) {
+    await auditCommand({
+      projectName: args.project,
+      environment: args.env,
+      verbose: args.verbose,
+      showValues: args.showValues
+    });
+    process.exit(0);
+  }
+
   // Check for provisioning or cleanup flags
   const hasProvisionFlag = args.provision ||
     args.provisionOnePassword ||
@@ -411,18 +458,29 @@ async function main() {
   }
 
   // Detect Wasp project (only required for provisioning, not cleanup)
-  const isWaspProject = detectWaspProject();
+  const waspDetection = detectWaspProject();
 
-  if (hasProvisionFlag && !isWaspProject) {
-    console.error('❌ No Wasp project detected in current directory');
+  if (hasProvisionFlag && !waspDetection.found) {
+    console.error('❌ No Wasp project detected');
     console.error('   Looking for: main.wasp or .wasproot');
+    console.error('   Searched in:');
+    console.error('     - Current directory');
+    console.error('     - ./app subdirectory');
     console.error('');
     console.error('   Run this from a Wasp project directory created with:');
     console.error('   wasp new -t saas my-app');
     process.exit(1);
   }
 
-  if (isWaspProject) {
+  // Change to Wasp directory if found in subdirectory
+  if (waspDetection.found && waspDetection.path !== process.cwd()) {
+    if (args.verbose) {
+      console.log(`✓ Found Wasp project in: ${path.relative(process.cwd(), waspDetection.path)}/`);
+    }
+    process.chdir(waspDetection.path);
+  }
+
+  if (waspDetection.found) {
     console.log('✓ Wasp project detected');
   }
 
@@ -453,8 +511,8 @@ async function main() {
       const components: ProviderName[] = [];
 
       if (args.cleanup) {
-        // Cleanup all components
-        components.push('onepassword', 'github', 'neon', 'caprover', 'vercel', 'netlify', 'resend');
+        // Cleanup all components (excluding GitHub - use --cleanup-github explicitly)
+        components.push('onepassword', 'neon', 'caprover', 'vercel', 'netlify', 'resend');
       } else {
         // Selective cleanup
         if (args.cleanupOnePassword) components.push('onepassword');
@@ -471,7 +529,7 @@ async function main() {
       if (args.project) {
         // Explicit --project flag
         projectName = args.project;
-      } else if (isWaspProject) {
+      } else if (waspDetection.found) {
         // Auto-detect from directory if in Wasp project
         projectName = detectProjectName();
       }
