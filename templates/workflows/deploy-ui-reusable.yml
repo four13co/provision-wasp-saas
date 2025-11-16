@@ -1,4 +1,4 @@
-name: Reusable Deploy Workflow
+name: Reusable UI Deploy Workflow
 
 on:
   workflow_call:
@@ -18,7 +18,7 @@ on:
         required: true
 
 jobs:
-  deploy:
+  build-and-deploy-ui:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -38,18 +38,12 @@ jobs:
           export-env: true
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          # CI/CD deployment credentials only - runtime secrets loaded by serverSetup.ts
-          CAPROVER_URL: op://${{ secrets.OP_VAULT }}/CapRover/Server/url
-          CAPROVER_APP_TOKEN: op://${{ secrets.OP_VAULT }}/CapRover/Deployment/app_token
+          # UI deployment credentials
           VERCEL_TOKEN: op://${{ secrets.OP_VAULT }}/Vercel/Credentials/token
           VERCEL_PROJECT_ID: op://${{ secrets.OP_VAULT }}/Vercel/Project/project_id
           VERCEL_ORG_ID: op://${{ secrets.OP_VAULT }}/Vercel/Organization/org_id
           API_URL: op://${{ secrets.OP_VAULT }}/CapRover/URLs/api_url
           APP_URL: op://${{ secrets.OP_VAULT }}/Vercel/URLs/app_url
-          GITHUB_PAT: op://${{ secrets.OP_VAULT }}/GitHub/Credentials/pat
-          GITHUB_USERNAME: op://${{ secrets.OP_VAULT }}/GitHub/Registry/username
-          # Migration secret needed for build-time database access
-          DATABASE_URL: op://${{ secrets.OP_VAULT }}/Neon/Database/database_url
 
       - name: Validate CI/CD environment variables
         run: node ../scripts/validate-env.js
@@ -73,10 +67,6 @@ jobs:
           REACT_APP_API_URL: ${{ env.API_URL }}
           WASP_WEB_CLIENT_URL: ${{ env.APP_URL }}
           WASP_SERVER_URL: ${{ env.API_URL }}
-
-      - name: Login to GitHub Container Registry
-        if: env.GITHUB_PAT != '' && env.GITHUB_USERNAME != ''
-        run: echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
 
       - name: Prepare Vercel Build Output API structure
         run: |
@@ -106,28 +96,16 @@ jobs:
           }
           EOF
 
-      - name: Copy captain-definition to server build
-        run: cp templates/captain-definition app/.wasp/build/server/
-
-      - name: Deploy backend to CapRover
-        run: |
-          cd app/.wasp/build/server
-          tar -czf ../../../../backend-deploy.tar.gz .
-          cd ../../../..
-          npx --yes caprover@latest deploy \
-            --caproverUrl "$CAPROVER_URL" \
-            --appToken "$CAPROVER_APP_TOKEN" \
-            --appName "{{PROJECT_NAME}}-api${{ inputs.app_name_suffix }}" \
-            --tarFile ./backend-deploy.tar.gz
-
       - name: Deploy frontend to Vercel
         run: npx vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN" --yes
         env:
           VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}
 
-      - name: Run database migrations
-        working-directory: app/.wasp/build/server
+      - name: Get Vercel deployment URL
         run: |
-          export DATABASE_URL="${DATABASE_URL}"
-          npx prisma migrate deploy --schema=../db/schema.prisma
+          DEPLOYMENT_URL=$(npx vercel ls --token "$VERCEL_TOKEN" --scope "$VERCEL_ORG_ID" | grep "${{ inputs.environment }}" | head -1 | awk '{print $2}')
+          echo "✓ Deployed to Vercel: https://${DEPLOYMENT_URL}"
+        env:
+          VERCEL_ORG_ID: ${{ env.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ env.VERCEL_PROJECT_ID }}

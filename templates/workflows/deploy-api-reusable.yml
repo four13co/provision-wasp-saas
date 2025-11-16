@@ -1,0 +1,192 @@
+name: Reusable API Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: 'Environment name (dev or prod)'
+      app_name_suffix:
+        required: true
+        type: string
+        description: 'App name suffix (e.g., -dev or -prod)'
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: true
+      OP_VAULT:
+        required: true
+
+jobs:
+  build-and-deploy-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Wasp
+        run: curl -sSL https://get.wasp-lang.dev/installer.sh | sh
+
+      - name: Load CI/CD secrets from 1Password
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          # API deployment credentials
+          CAPROVER_URL: op://${{ secrets.OP_VAULT }}/CapRover/Server/url
+          CAPROVER_APP_TOKEN: op://${{ secrets.OP_VAULT }}/CapRover/Deployment/app_token
+          API_URL: op://${{ secrets.OP_VAULT }}/CapRover/URLs/api_url
+          APP_URL: op://${{ secrets.OP_VAULT }}/Vercel/URLs/app_url
+          GITHUB_PAT: op://${{ secrets.OP_VAULT }}/GitHub/Credentials/pat
+          GITHUB_USERNAME: op://${{ secrets.OP_VAULT }}/GitHub/Registry/username
+          # Migration secret needed for build-time database access
+          DATABASE_URL: op://${{ secrets.OP_VAULT }}/Neon/Database/database_url
+
+      - name: Validate CI/CD environment variables
+        run: node ../scripts/validate-env.js
+        working-directory: app
+
+      - name: Build .env.client
+        run: node ../scripts/generate-env-client.js
+        working-directory: app
+
+      - name: Build Wasp project
+        run: wasp build
+        working-directory: app
+        env:
+          WASP_WEB_CLIENT_URL: ${{ env.APP_URL }}
+          WASP_SERVER_URL: ${{ env.API_URL }}
+
+      - name: Login to GitHub Container Registry
+        if: env.GITHUB_PAT != '' && env.GITHUB_USERNAME != ''
+        run: echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
+
+      - name: Set Docker image tag
+        run: |
+          echo "DOCKER_IMAGE=ghcr.io/${{ github.repository_owner }}/$(echo ${{ github.repository }} | cut -d'/' -f2)-api${{ inputs.app_name_suffix }}:latest" >> $GITHUB_ENV
+
+      - name: Build and push Docker image to GHCR
+        working-directory: app/.wasp/build/server
+        run: |
+          # Copy Dockerfile to server build directory
+          cp ../../../../templates/Dockerfile ./
+
+          # Build Docker image
+          docker build -t "$DOCKER_IMAGE" .
+
+          # Push to GHCR
+          docker push "$DOCKER_IMAGE"
+
+          echo "✓ Pushed Docker image: $DOCKER_IMAGE"
+
+      - name: Deploy backend to CapRover (pull from GHCR)
+        run: |
+          # Get CapRover API base URL
+          CAPROVER_API=$(echo "$CAPROVER_URL" | sed 's|/$||' | sed 's|/api/.*||')/api/v2
+
+          # Login to CapRover API
+          LOGIN_RESPONSE=$(curl -s -X POST "$CAPROVER_API/login" \
+            -H "Content-Type: application/json" \
+            -H "x-namespace: captain" \
+            -d "{\"password\": \"$CAPROVER_APP_TOKEN\"}")
+
+          TOKEN=$(echo "$LOGIN_RESPONSE" | jq -r '.data.token')
+
+          if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+            echo "❌ Failed to authenticate with CapRover"
+            exit 1
+          fi
+
+          # Trigger image pull and deployment
+          APP_NAME="{{PROJECT_NAME}}-api${{ inputs.app_name_suffix }}"
+
+          DEPLOY_RESPONSE=$(curl -s -X POST "$CAPROVER_API/user/apps/webhooks/triggerbuild" \
+            -H "Content-Type: application/json" \
+            -H "x-namespace: captain" \
+            -H "x-captain-auth: $TOKEN" \
+            -d "{
+              \"appName\": \"$APP_NAME\",
+              \"imageName\": \"$DOCKER_IMAGE\",
+              \"gitHash\": \"${{ github.sha }}\"
+            }")
+
+          # Check deployment status
+          STATUS=$(echo "$DEPLOY_RESPONSE" | jq -r '.status')
+
+          if [ "$STATUS" != "100" ]; then
+            echo "❌ Deployment failed"
+            echo "$DEPLOY_RESPONSE" | jq '.'
+            exit 1
+          fi
+
+          echo "✓ Deployed to CapRover: $APP_NAME"
+          echo "✓ Image: $DOCKER_IMAGE"
+
+      - name: Run database migrations
+        working-directory: app/.wasp/build/server
+        run: |
+          export DATABASE_URL="${DATABASE_URL}"
+          npx prisma migrate deploy --schema=../db/schema.prisma
+
+  cleanup-old-images:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy-api
+    if: always()
+    steps:
+      - name: Load secrets for cleanup
+        uses: 1password/load-secrets-action@v2
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          GITHUB_PAT: op://${{ secrets.OP_VAULT }}/GitHub/Credentials/pat
+
+      - name: Cleanup old GHCR images
+        run: |
+          # Install GitHub CLI if not available
+          if ! command -v gh &> /dev/null; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          fi
+
+          # Authenticate with GitHub CLI using PAT
+          echo "$GITHUB_PAT" | gh auth login --with-token
+
+          REPO_NAME=$(echo ${{ github.repository }} | cut -d'/' -f2)
+          PACKAGE_NAME="${REPO_NAME}-api${{ inputs.app_name_suffix }}"
+
+          echo "Cleaning up old images for package: $PACKAGE_NAME"
+
+          # Get all versions (tags) for this package, sorted by creation date
+          VERSIONS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/users/${{ github.repository_owner }}/packages/container/${PACKAGE_NAME}/versions" \
+            --jq 'sort_by(.created_at) | reverse | .[5:] | .[].id' 2>/dev/null || echo "")
+
+          if [ -z "$VERSIONS" ]; then
+            echo "No old images to clean up (less than 6 versions exist)"
+            exit 0
+          fi
+
+          # Delete versions beyond the first 5
+          echo "$VERSIONS" | while read VERSION_ID; do
+            if [ -n "$VERSION_ID" ]; then
+              echo "Deleting version ID: $VERSION_ID"
+              gh api \
+                --method DELETE \
+                -H "Accept: application/vnd.github+json" \
+                "/users/${{ github.repository_owner }}/packages/container/${PACKAGE_NAME}/versions/${VERSION_ID}" \
+                && echo "✓ Deleted version $VERSION_ID" \
+                || echo "⚠️  Failed to delete version $VERSION_ID"
+            fi
+          done
+
+          echo "✓ Cleanup complete - keeping last 5 images"

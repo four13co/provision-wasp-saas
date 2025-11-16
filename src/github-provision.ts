@@ -358,9 +358,9 @@ export async function copyScriptTemplates(options: { projectName: string; verbos
 }
 
 /**
- * Copy CapRover configuration file to user's project
+ * Copy Dockerfile template to user's project
  */
-export async function copyCapRoverConfig(options: { verbose?: boolean }): Promise<void> {
+export async function copyDockerfile(options: { verbose?: boolean }): Promise<void> {
   const { verbose } = options;
 
   // Find git root directory (check current dir and parent)
@@ -374,21 +374,26 @@ export async function copyCapRoverConfig(options: { verbose?: boolean }): Promis
   }
 
   // Get template file path
-  const templatePath = path.join(__dirname, '../templates/captain-definition');
+  const templatePath = path.join(__dirname, '../templates/Dockerfile');
 
   if (!fs.existsSync(templatePath)) {
-    throw new Error(`CapRover config template not found: ${templatePath}`);
+    throw new Error(`Dockerfile template not found: ${templatePath}`);
   }
 
-  // Copy to git root
-  const targetPath = path.join(gitRoot, 'captain-definition');
+  // Copy to templates directory in git root
+  const templatesDir = path.join(gitRoot, 'templates');
+  if (!fs.existsSync(templatesDir)) {
+    fs.mkdirSync(templatesDir, { recursive: true });
+  }
+
+  const targetPath = path.join(templatesDir, 'Dockerfile');
   const content = fs.readFileSync(templatePath, 'utf-8');
   fs.writeFileSync(targetPath, content);
 
   if (verbose) {
-    console.log(`  ✓ Copied captain-definition to project root`);
+    console.log(`  ✓ Copied Dockerfile to templates/`);
   } else {
-    console.log(`  ✓ Copied CapRover configuration`);
+    console.log(`  ✓ Copied Docker configuration`);
   }
 }
 

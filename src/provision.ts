@@ -6,7 +6,7 @@
 import path from 'node:path';
 import { parseWaspEnv } from './wasp-parser.js';
 import { ensureOpAuth, opEnsureVault } from './op-util.js';
-import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates, copyScriptTemplates, copyCapRoverConfig } from './github-provision.js';
+import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates, copyScriptTemplates, copyDockerfile } from './github-provision.js';
 import { emitEnvFiles } from './env-emit.js';
 import { provisionOnePassword } from './onepassword-provision.js';
 import { providers, resolveDependencies, getExecutionOrder, ProviderName, InfraProviderName } from './providers.js';
@@ -186,7 +186,7 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
 
           await copyWorkflowTemplates({ projectName, verbose });
           await copyScriptTemplates({ projectName, verbose });
-          await copyCapRoverConfig({ verbose });
+          await copyDockerfile({ verbose });
 
           if (verbose) {
             console.log(`  ✓ GitHub repository configured`);

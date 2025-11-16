@@ -18,12 +18,14 @@ import { cleanup } from './cleanup.js';
 import { checkConfig } from './check-config.js';
 import { initCommand } from './init-command.js';
 import { auditCommand } from './audit-command.js';
+import { updateWorkflows } from './update-workflows.js';
 
 interface CliArgs {
   // Tool commands
   init: boolean;
   checkConfig: boolean;
   audit: boolean;
+  updateWorkflows: boolean;
 
   // Full provisioning
   provision: boolean;
@@ -99,6 +101,7 @@ function parseArgs(): CliArgs {
     init: args.includes('init') || args.includes('--init'),
     checkConfig: args.includes('--check-config'),
     audit: args.includes('--audit'),
+    updateWorkflows: args.includes('--update-workflows'),
     provision: args.includes('--provision'),
     provisionOnePassword: args.includes('--provision-onepassword') || args.includes('--provision-1password'),
     provisionNeon: args.includes('--provision-neon'),
@@ -145,6 +148,10 @@ USAGE:
 
 SETUP COMMANDS:
   init                           Set up infrastructure credentials in 1Password vault
+
+UPDATE COMMANDS:
+  --update-workflows             Update workflow files to latest version (parallel deployments)
+                                 Backs up existing files to .github/workflows.backup/
 
 AUDIT COMMANDS:
   --audit --project <name>       Audit 1Password vaults for a project (read-only)
@@ -417,6 +424,16 @@ async function main() {
       environment: args.env,
       verbose: args.verbose,
       showValues: args.showValues
+    });
+    process.exit(0);
+  }
+
+  if (args.updateWorkflows) {
+    console.log('🔄 Updating workflow files...\n');
+    await updateWorkflows({
+      verbose: args.verbose,
+      dryRun: args.dryRun,
+      force: args.force
     });
     process.exit(0);
   }
