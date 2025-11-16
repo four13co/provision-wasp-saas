@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupServiceAccountAndSecrets, getGitHubOwner } from './service-account.js';
 import { RollbackAction } from './rollback.js';
+import { ensureOpAuth, opEnsureVault, opEnsureItemWithSections, ItemSection } from './op-util.js';
 
 // ES module equivalent of __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -23,6 +24,7 @@ export interface GitHubSecretsOptions {
   environments: Array<'dev' | 'prod'>;
   verbose?: boolean;
   force?: boolean;
+  updateCapRover?: boolean; // If true, also update CapRover app env vars
 }
 
 export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void> {
@@ -82,8 +84,84 @@ export async function createGitHubRepo(options: GitHubRepoOptions): Promise<void
   if (verbose) console.log('  Initialized git with Development and Production branches');
 }
 
+/**
+ * Create GitHub item in 1Password vault with PAT and username
+ */
+export async function createGitHubVaultItem(vaultName: string, verbose?: boolean): Promise<void> {
+  try {
+    ensureOpAuth();
+    opEnsureVault(vaultName);
+
+    // Get GitHub credentials - try wasp-primary vault first, then fall back to gh CLI
+    let pat: string | undefined;
+    let username: string | undefined;
+
+    // First, try to read from wasp-primary vault
+    try {
+      pat = execSync('op read "op://wasp-primary/GitHub/Credentials/pat"', {
+        stdio: 'pipe',
+        encoding: 'utf-8'
+      }).trim();
+
+      username = execSync('op read "op://wasp-primary/GitHub/Registry/username"', {
+        stdio: 'pipe',
+        encoding: 'utf-8'
+      }).trim();
+
+      if (verbose && pat && username) {
+        console.log(`  Using GitHub credentials from wasp-primary vault`);
+      }
+    } catch (e: any) {
+      // Fall back to gh CLI if wasp-primary vault doesn't have the credentials
+      if (verbose) {
+        console.log(`  wasp-primary vault not found, trying gh CLI...`);
+      }
+
+      try {
+        pat = execSync('gh auth token', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+      } catch (e: any) {
+        throw new Error(`Failed to get GitHub PAT: ${e?.message || e}. Make sure you're logged in with 'gh auth login' or have credentials in wasp-primary vault`);
+      }
+
+      try {
+        username = execSync('gh api user -q .login', { stdio: 'pipe', encoding: 'utf-8' }).trim();
+      } catch (e: any) {
+        throw new Error(`Failed to get GitHub username: ${e?.message || e}`);
+      }
+    }
+
+    if (!pat || !username) {
+      throw new Error('GitHub PAT or username is empty');
+    }
+
+    // Create GitHub item with sections
+    const githubSections: ItemSection[] = [
+      {
+        label: 'Credentials',
+        fields: [
+          { label: 'pat', value: pat, type: 'CONCEALED' }
+        ]
+      },
+      {
+        label: 'Registry',
+        fields: [
+          { label: 'username', value: username, type: 'STRING' }
+        ]
+      }
+    ];
+
+    opEnsureItemWithSections(vaultName, 'GitHub', githubSections, undefined, verbose);
+
+    if (verbose) {
+      console.log(`  ✓ Created GitHub item in vault: ${vaultName}`);
+    }
+  } catch (e: any) {
+    throw new Error(`Failed to create GitHub 1Password item: ${e?.message || e}`);
+  }
+}
+
 export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise<{ rollbackActions: RollbackAction[] }> {
-  const { projectName, environments, verbose, force = false } = options;
+  const { projectName, environments, verbose, force = false, updateCapRover = false } = options;
   const rollbackActions: RollbackAction[] = [];
 
   // Get GitHub owner and construct repo full name
@@ -95,14 +173,38 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
     if (force) {
       console.log(`  Force mode enabled - will reprovision all secrets`);
     }
+    if (updateCapRover) {
+      console.log(`  Will also update CapRover environment variables`);
+    }
   }
 
   let createdCount = 0;
   let skippedCount = 0;
 
+  // Get CapRover credentials if we need to update apps
+  let caproverCredentials: { url?: string; password?: string } = {};
+  if (updateCapRover) {
+    const { getCapRoverCredentials } = await import('./credentials.js');
+    const creds = getCapRoverCredentials();
+    caproverCredentials = {
+      url: creds.url ?? undefined,
+      password: creds.password ?? undefined
+    };
+  }
+
   // Create service account and GitHub secrets for each environment
   for (const env of environments) {
     const vaultName = `${projectName}-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-');
+    const appName = updateCapRover ? `${projectName}-api-${env}`.toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '-') : undefined;
+
+    // Create GitHub item in vault with PAT and username
+    try {
+      await createGitHubVaultItem(vaultName, verbose);
+    } catch (e: any) {
+      // Warn but don't fail - the service account setup can still proceed
+      console.warn(`  Warning: Failed to create GitHub item in ${vaultName}: ${e?.message || e}`);
+      console.warn(`  You may need to manually add GitHub PAT and username to the vault`);
+    }
 
     try {
       const { rollbackActions: envRollback, skipped } = await setupServiceAccountAndSecrets({
@@ -111,7 +213,12 @@ export async function setupGitHubSecrets(options: GitHubSecretsOptions): Promise
         vaultName,
         repo,
         verbose,
-        force
+        force,
+        caprover: updateCapRover && appName ? {
+          appName,
+          url: caproverCredentials.url,
+          password: caproverCredentials.password
+        } : undefined
       });
 
       rollbackActions.push(...envRollback);
@@ -251,9 +358,9 @@ export async function copyScriptTemplates(options: { projectName: string; verbos
 }
 
 /**
- * Copy CapRover configuration file to user's project
+ * Copy Dockerfile template to user's project
  */
-export async function copyCapRoverConfig(options: { verbose?: boolean }): Promise<void> {
+export async function copyDockerfile(options: { verbose?: boolean }): Promise<void> {
   const { verbose } = options;
 
   // Find git root directory (check current dir and parent)
@@ -267,21 +374,26 @@ export async function copyCapRoverConfig(options: { verbose?: boolean }): Promis
   }
 
   // Get template file path
-  const templatePath = path.join(__dirname, '../templates/captain-definition');
+  const templatePath = path.join(__dirname, '../templates/Dockerfile');
 
   if (!fs.existsSync(templatePath)) {
-    throw new Error(`CapRover config template not found: ${templatePath}`);
+    throw new Error(`Dockerfile template not found: ${templatePath}`);
   }
 
-  // Copy to git root
-  const targetPath = path.join(gitRoot, 'captain-definition');
+  // Copy to templates directory in git root
+  const templatesDir = path.join(gitRoot, 'templates');
+  if (!fs.existsSync(templatesDir)) {
+    fs.mkdirSync(templatesDir, { recursive: true });
+  }
+
+  const targetPath = path.join(templatesDir, 'Dockerfile');
   const content = fs.readFileSync(templatePath, 'utf-8');
   fs.writeFileSync(targetPath, content);
 
   if (verbose) {
-    console.log(`  ✓ Copied captain-definition to project root`);
+    console.log(`  ✓ Copied Dockerfile to templates/`);
   } else {
-    console.log(`  ✓ Copied CapRover configuration`);
+    console.log(`  ✓ Copied Docker configuration`);
   }
 }
 

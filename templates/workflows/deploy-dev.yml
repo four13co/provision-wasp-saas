@@ -5,8 +5,17 @@ on:
     branches: [Development]
 
 jobs:
-  deploy:
-    uses: ./.github/workflows/deploy-reusable.yml
+  deploy-api:
+    uses: ./.github/workflows/deploy-api-reusable.yml
+    with:
+      environment: dev
+      app_name_suffix: -dev
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN_DEV }}
+      OP_VAULT: ${{ secrets.OP_VAULT_DEV }}
+
+  deploy-ui:
+    uses: ./.github/workflows/deploy-ui-reusable.yml
     with:
       environment: dev
       app_name_suffix: -dev

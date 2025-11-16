@@ -6,7 +6,7 @@
 import path from 'node:path';
 import { parseWaspEnv } from './wasp-parser.js';
 import { ensureOpAuth, opEnsureVault } from './op-util.js';
-import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates, copyScriptTemplates, copyCapRoverConfig } from './github-provision.js';
+import { createGitHubRepo, setupGitHubSecrets, copyWorkflowTemplates, copyScriptTemplates, copyDockerfile } from './github-provision.js';
 import { emitEnvFiles } from './env-emit.js';
 import { provisionOnePassword } from './onepassword-provision.js';
 import { providers, resolveDependencies, getExecutionOrder, ProviderName, InfraProviderName } from './providers.js';
@@ -136,7 +136,8 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
               projectName,
               envSuffix: env,
               verbose,
-              dryRun
+              dryRun,
+              force
             });
 
             rollbackActions.push(...providerRollback);
@@ -171,17 +172,21 @@ export async function provision(options: ProvisionOptions = {}): Promise<void> {
         try {
           await createGitHubRepo({ projectName, verbose });
 
+          // Check if CapRover was provisioned so we can update env vars
+          const caproverProvisioned = componentsToProvision.includes('caprover');
+
           const { rollbackActions: githubRollback } = await setupGitHubSecrets({
             projectName,
             environments,
             verbose,
-            force
+            force,
+            updateCapRover: caproverProvisioned
           });
           rollbackActions.push(...githubRollback);
 
           await copyWorkflowTemplates({ projectName, verbose });
           await copyScriptTemplates({ projectName, verbose });
-          await copyCapRoverConfig({ verbose });
+          await copyDockerfile({ verbose });
 
           if (verbose) {
             console.log(`  ✓ GitHub repository configured`);
